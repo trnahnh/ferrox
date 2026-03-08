@@ -149,7 +149,7 @@ fn bench_e2e_mixed(c: &mut Criterion) {
 fn bench_e2e_per_order(c: &mut Criterion) {
     let n = 100_000usize;
 
-    c.bench_function("e2e/per_order_latency", |b| {
+    c.bench_function("e2e/avg_crossing_100k", |b| {
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
 

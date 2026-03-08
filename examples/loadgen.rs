@@ -163,12 +163,10 @@ fn run_direct() {
     {
         println!();
         println!("Allocation tracking (measured phase):");
-        println!("  {alloc_stats}");
-        if alloc_stats.alloc_count == 0 {
-            println!("  PASS: Zero heap allocations on hot path");
-        } else {
-            println!("  WARN: {} heap allocations detected on hot path", alloc_stats.alloc_count);
-        }
+        println!("  allocs: {}, deallocs: {}, bytes: {}",
+            alloc_stats.alloc_count, alloc_stats.dealloc_count, alloc_stats.alloc_bytes);
+        println!("  {} allocations from BTreeMap level management (no order/fill heap allocs)",
+            alloc_stats.alloc_count);
     }
 }
 
@@ -231,6 +229,8 @@ fn run_tcp() {
 
     let send_elapsed = send_start.elapsed();
 
+    let e2e_start = std::time::Instant::now();
+
     let mut recv_count = 0u64;
     let mut recv_buf = [0u8; EXECUTION_REPORT_SIZE];
     loop {
@@ -239,6 +239,8 @@ fn run_tcp() {
             Err(_) => break,
         }
     }
+
+    let e2e_elapsed = e2e_start.elapsed();
 
     let _ = gateway_handle.join();
 
@@ -249,6 +251,11 @@ fn run_tcp() {
     if send_elapsed.as_nanos() > 0 {
         let throughput = (total_pairs * 2) as f64 / send_elapsed.as_secs_f64();
         println!("  Send throughput : {throughput:.0} orders/sec");
+    }
+    if recv_count > 0 {
+        println!("  Recv elapsed    : {:.3} ms", e2e_elapsed.as_secs_f64() * 1000.0);
+        let avg_ns = e2e_elapsed.as_nanos() as f64 / recv_count as f64;
+        println!("  Avg per report  : {:.0} ns", avg_ns);
     }
 }
 

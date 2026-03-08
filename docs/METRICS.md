@@ -242,7 +242,7 @@ Recovery from snapshot + 10K WAL replay: **~1.4 ms** worst case.
 | e2e/crossing_orders/1k | 34 µs | 34 ns/order |
 | e2e/crossing_orders/10k | 405 µs | 40 ns/order |
 | e2e/mixed_100k | 6.4 ms | 64 ns/op |
-| e2e/per_order_latency (100K) | 5.6 ms | 56 ns/order |
+| e2e/avg_crossing_100k (100K) | 5.6 ms | 56 ns/order |
 
 ### Allocation Tracking
 
