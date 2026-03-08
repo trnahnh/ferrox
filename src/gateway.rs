@@ -149,7 +149,7 @@ fn process_command(
         EngineCommand::NewOrder(order) => {
             let timestamp = order.timestamp;
             if let Ok(result) = engine.add_order(order) {
-                for fill in &result.fills {
+                for fill in result.fills {
                     *seq_num = seq_num.wrapping_add(1);
                     if encode_execution_report(report_buf, *seq_num, fill, timestamp).is_ok() {
                         let _ = udp.send_to(report_buf, multicast_addr);

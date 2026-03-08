@@ -18,11 +18,11 @@ pub enum OrderStatus {
     CancelledSelfTrade,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AddOrderResult {
+#[derive(Debug, PartialEq, Eq)]
+pub struct AddOrderResult<'a> {
     pub order_id: u64,
     pub status: OrderStatus,
-    pub fills: Vec<Fill>,
+    pub fills: &'a [Fill],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,14 +63,11 @@ impl MatchingEngine {
         &self.book
     }
 
-    pub fn add_order(&mut self, mut order: Order) -> Result<AddOrderResult, MatchingError> {
+    pub fn add_order(&mut self, mut order: Order) -> Result<AddOrderResult<'_>, MatchingError> {
         if order.quantity == 0 {
             return Err(MatchingError::ZeroQuantity);
         }
 
-        if self.fills_buf.capacity() == 0 {
-            self.fills_buf.reserve(FILLS_INITIAL_CAPACITY);
-        }
         self.fills_buf.clear();
 
         let order_id = order.id;
@@ -167,7 +164,7 @@ impl MatchingEngine {
         Ok(AddOrderResult {
             order_id,
             status,
-            fills: std::mem::take(&mut self.fills_buf),
+            fills: &self.fills_buf,
         })
     }
 
@@ -577,7 +574,7 @@ mod proptests {
                 let id = (i + 1) as u64;
                 let order = Order::new(id, id, side, price, qty, id).unwrap();
                 if let Ok(result) = engine.add_order(order) {
-                    for fill in &result.fills {
+                    for fill in result.fills {
                         prop_assert!(fill.quantity > 0, "fill with zero quantity");
                     }
                 }
