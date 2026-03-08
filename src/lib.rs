@@ -1,7 +1,9 @@
+pub mod alloc_track;
 pub(crate) mod arena;
 pub mod book;
 pub mod gateway;
 pub mod matching;
+pub mod metrics;
 pub mod order;
 pub mod protocol;
 pub(crate) mod recovery;
