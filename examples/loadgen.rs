@@ -7,9 +7,7 @@ static GLOBAL: TrackingAllocator = TrackingAllocator;
 
 use ferrox::matching::MatchingEngine;
 use ferrox::order::{Order, Side};
-use ferrox::protocol::{
-    EngineCommand, EXECUTION_REPORT_SIZE, encode_execution_report,
-};
+use ferrox::protocol::{EXECUTION_REPORT_SIZE, EngineCommand, encode_execution_report};
 use ferrox::ring;
 
 #[cfg(feature = "metrics")]
@@ -30,8 +28,7 @@ fn run_direct() {
     println!("  Warmup:  {WARMUP_COUNT}");
     println!();
 
-    let (mut producer, mut consumer) =
-        ring::ring_buffer::<EngineCommand>(RING_CAPACITY);
+    let (mut producer, mut consumer) = ring::ring_buffer::<EngineCommand>(RING_CAPACITY);
     let mut engine = MatchingEngine::with_capacity(ARENA_CAPACITY);
 
     let total_pairs = ORDER_COUNT;
@@ -75,12 +72,7 @@ fn run_direct() {
                         if let Ok(result) = engine.add_order(order) {
                             for fill in result.fills {
                                 seq += 1;
-                                let _ = encode_execution_report(
-                                    &mut report_buf,
-                                    seq,
-                                    fill,
-                                    ts,
-                                );
+                                let _ = encode_execution_report(&mut report_buf, seq, fill, ts);
                             }
                         }
                     }
@@ -116,12 +108,7 @@ fn run_direct() {
                 if let Ok(result) = engine.add_order(order) {
                     for fill in result.fills {
                         seq += 1;
-                        let _ = encode_execution_report(
-                            &mut report_buf,
-                            seq,
-                            fill,
-                            ts,
-                        );
+                        let _ = encode_execution_report(&mut report_buf, seq, fill, ts);
                         fill_count += 1;
                     }
                 }
@@ -146,7 +133,10 @@ fn run_direct() {
     println!("=== Results ===");
     println!("  Measured orders : {measured_count}");
     println!("  Fills produced  : {fill_count}");
-    println!("  Elapsed         : {:.3} ms", elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "  Elapsed         : {:.3} ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
 
     if elapsed.as_nanos() > 0 {
         let throughput = measured_count as f64 / elapsed.as_secs_f64();
@@ -163,10 +153,14 @@ fn run_direct() {
     {
         println!();
         println!("Allocation tracking (measured phase):");
-        println!("  allocs: {}, deallocs: {}, bytes: {}",
-            alloc_stats.alloc_count, alloc_stats.dealloc_count, alloc_stats.alloc_bytes);
-        println!("  {} allocations from BTreeMap level management (no order/fill heap allocs)",
-            alloc_stats.alloc_count);
+        println!(
+            "  allocs: {}, deallocs: {}, bytes: {}",
+            alloc_stats.alloc_count, alloc_stats.dealloc_count, alloc_stats.alloc_bytes
+        );
+        println!(
+            "  {} allocations from BTreeMap level management (no order/fill heap allocs)",
+            alloc_stats.alloc_count
+        );
     }
 }
 
@@ -200,7 +194,9 @@ fn run_tcp() {
     std::thread::sleep(Duration::from_millis(100));
 
     let udp_recv = UdpSocket::bind(udp_addr).unwrap();
-    udp_recv.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    udp_recv
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
 
     let total_pairs = ORDER_COUNT;
 
@@ -247,13 +243,19 @@ fn run_tcp() {
     println!("=== Results ===");
     println!("  Orders sent     : {}", total_pairs * 2);
     println!("  Reports received: {recv_count}");
-    println!("  Send elapsed    : {:.3} ms", send_elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "  Send elapsed    : {:.3} ms",
+        send_elapsed.as_secs_f64() * 1000.0
+    );
     if send_elapsed.as_nanos() > 0 {
         let throughput = (total_pairs * 2) as f64 / send_elapsed.as_secs_f64();
         println!("  Send throughput : {throughput:.0} orders/sec");
     }
     if recv_count > 0 {
-        println!("  Recv elapsed    : {:.3} ms", e2e_elapsed.as_secs_f64() * 1000.0);
+        println!(
+            "  Recv elapsed    : {:.3} ms",
+            e2e_elapsed.as_secs_f64() * 1000.0
+        );
         let avg_ns = e2e_elapsed.as_nanos() as f64 / recv_count as f64;
         println!("  Avg per report  : {:.0} ns", avg_ns);
     }

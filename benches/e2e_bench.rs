@@ -1,9 +1,7 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use ferrox::matching::MatchingEngine;
 use ferrox::order::{Order, Side};
-use ferrox::protocol::{
-    EngineCommand, EXECUTION_REPORT_SIZE, encode_execution_report,
-};
+use ferrox::protocol::{EXECUTION_REPORT_SIZE, EngineCommand, encode_execution_report};
 use ferrox::ring;
 
 fn make_order(id: u64, trader_id: u64, side: Side, price: i64, qty: u64) -> Order {
@@ -50,12 +48,8 @@ fn bench_e2e_crossing(c: &mut Criterion) {
                                 if let Ok(result) = engine.add_order(order) {
                                     for fill in result.fills {
                                         seq += 1;
-                                        let _ = encode_execution_report(
-                                            &mut report_buf,
-                                            seq,
-                                            fill,
-                                            ts,
-                                        );
+                                        let _ =
+                                            encode_execution_report(&mut report_buf, seq, fill, ts);
                                     }
                                 }
                             }
@@ -78,8 +72,7 @@ fn bench_e2e_mixed(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let cap = 131_072;
-                let (mut producer, consumer) =
-                    ring::ring_buffer::<EngineCommand>(cap);
+                let (mut producer, consumer) = ring::ring_buffer::<EngineCommand>(cap);
                 let engine = MatchingEngine::with_capacity(65_536);
 
                 let mut next_id = 1u64;
@@ -126,12 +119,7 @@ fn bench_e2e_mixed(c: &mut Criterion) {
                             if let Ok(result) = engine.add_order(order) {
                                 for fill in result.fills {
                                     seq += 1;
-                                    let _ = encode_execution_report(
-                                        &mut report_buf,
-                                        seq,
-                                        fill,
-                                        ts,
-                                    );
+                                    let _ = encode_execution_report(&mut report_buf, seq, fill, ts);
                                 }
                             }
                         }
@@ -186,12 +174,7 @@ fn bench_e2e_per_order(c: &mut Criterion) {
                             if let Ok(result) = engine.add_order(order) {
                                 for fill in result.fills {
                                     seq += 1;
-                                    let _ = encode_execution_report(
-                                        &mut report_buf,
-                                        seq,
-                                        fill,
-                                        ts,
-                                    );
+                                    let _ = encode_execution_report(&mut report_buf, seq, fill, ts);
                                 }
                             }
                         }
@@ -208,5 +191,10 @@ fn bench_e2e_per_order(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_e2e_crossing, bench_e2e_mixed, bench_e2e_per_order);
+criterion_group!(
+    benches,
+    bench_e2e_crossing,
+    bench_e2e_mixed,
+    bench_e2e_per_order
+);
 criterion_main!(benches);
