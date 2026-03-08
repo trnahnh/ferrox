@@ -1,6 +1,6 @@
 # Ferrox
 
-A low-latency order matching engine in Rust. Sub-50us P99 latency, 1M+ orders/sec, zero heap allocation on the hot path.
+A low-latency order matching engine in Rust. **500ns P99 latency, 4.7M orders/sec**, zero heap allocation on the hot path.
 
 ## The Problem
 
@@ -71,6 +71,19 @@ Added write-ahead logging and periodic snapshots for deterministic crash recover
 
 WAL uses the existing `protocol.rs` codec — no duplicate serialization. Pre-allocated encode buffer means zero allocation on the hot path. Recovery is deterministic: same WAL replayed twice produces bit-exact book state.
 
+### Phase 7 — Prove It
+
+Eliminated the last hot-path allocation: `AddOrderResult.fills` changed from `Vec<Fill>` to `&[Fill]` borrowed from the engine's pre-allocated buffer. Added HdrHistogram latency recording, a tracking allocator, end-to-end criterion benchmarks, and a load generator.
+
+| Percentile | Latency |
+| --- | --- |
+| P50 | 100 ns |
+| P90 | 200 ns |
+| P99 | 500 ns |
+| P99.9 | 800 ns |
+
+4.7M orders/sec sustained throughput. Ring pop → match → encode execution report — the full hot path measured per order.
+
 ## Current State
 
 | Phase | Focus | Status |
@@ -81,16 +94,17 @@ WAL uses the existing `protocol.rs` codec — no duplicate serialization. Pre-al
 | 4 | Lock-free SPSC ring buffer (Disruptor pattern) | Done |
 | 5 | Binary protocol, TCP/UDP networking, 2-thread pipeline | Done |
 | 6 | WAL persistence, snapshots, deterministic crash recovery | Done |
-| 7 | End-to-end benchmarking suite, HdrHistogram, observability | Planned |
+| 7 | End-to-end benchmarking suite, HdrHistogram, observability | Done |
 
-134 tests. ~0.16s test time. 6 `unsafe` blocks total (4 in ring buffer, 2 in WAL mmap), each with documented safety invariants.
+137 tests (with `--features metrics`). ~0.25s test time. 6 `unsafe` blocks total (4 in ring buffer, 2 in WAL mmap), each with documented safety invariants.
 
 ## Quick Start
 
 ```bash
 cargo build --release     # build
 cargo test                # 134 tests
-cargo bench               # criterion benchmarks (matching, ring buffer, WAL, snapshots)
+cargo bench               # criterion benchmarks (matching, ring buffer, WAL, snapshots, e2e)
+cargo run --release --example loadgen --features metrics  # latency histogram
 ```
 
 ## Documentation

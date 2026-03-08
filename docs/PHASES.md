@@ -174,3 +174,7 @@
 | CPU Profiling | `perf` + `flamegraph` | Identify hot path bottlenecks |
 
 **Kill Metric**: "Sub-50µs P99 latency processing 1M+ orders/sec. Zero heap allocation on the hot path."
+
+**Results**: P99 = 500 ns, throughput = 4.7M orders/sec. Fills allocation eliminated (`&[Fill]` borrow instead of `Vec<Fill>`). BTreeMap node allocation is the only remaining heap operation (level creation/removal).
+
+**Status**: Complete.

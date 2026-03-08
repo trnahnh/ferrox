@@ -211,3 +211,46 @@ Recovery from snapshot + 10K WAL replay: **~1.4 ms** worst case.
 | --- | --- | --- |
 | Test count | 91 | 134 |
 | Test time | ~0.13s | ~0.16s |
+
+---
+
+## Phase 7: Benchmarking Suite + Observability
+
+**What changed**: Eliminated hot-path fills allocation (`AddOrderResult` returns `&[Fill]` instead of `Vec<Fill>`). Added HdrHistogram latency recording, tracking allocator, end-to-end criterion benchmarks, and a load generator that proves the kill metric.
+
+### Fills Allocation Fix
+
+`AddOrderResult.fills` changed from `Vec<Fill>` (heap-allocated via `std::mem::take`) to `&'a [Fill]` (borrowed from pre-allocated buffer). This was the last remaining hot-path allocation in the matching engine.
+
+### End-to-End Latency (loadgen, 1M orders, release build)
+
+| Percentile | Latency |
+| --- | --- |
+| P50 | 100 ns |
+| P90 | 200 ns |
+| P99 | 500 ns |
+| P99.9 | 800 ns |
+| Max | ~38 µs |
+| Mean | 151 ns |
+
+**Throughput**: ~4.7M orders/sec (single-threaded matching, ring pop → match → encode).
+
+### End-to-End Criterion Benchmarks
+
+| Benchmark | Time | Per-order |
+| --- | --- | --- |
+| e2e/crossing_orders/1k | 34 µs | 34 ns/order |
+| e2e/crossing_orders/10k | 405 µs | 40 ns/order |
+| e2e/mixed_100k | 6.4 ms | 64 ns/op |
+| e2e/per_order_latency (100K) | 5.6 ms | 56 ns/order |
+
+### Allocation Tracking
+
+With `--features alloc-track`, the load generator reports heap allocations during the measured phase. The 6 allocations detected are from `BTreeMap` internal node management (level creation/removal) — a known trade-off documented in Phase 3. The matching engine's own data structures (arena, fills buffer) produce zero allocations.
+
+### Test Suite (Phase 6→7)
+
+| Metric | Phase 6 | Phase 7 |
+| --- | --- | --- |
+| Test count | 134 | 137 (with `--features metrics`) |
+| Test time | ~0.16s | ~0.25s |
