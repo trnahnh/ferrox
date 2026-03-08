@@ -202,7 +202,6 @@ fn matching_loop(
             }
             Err(_empty) => {
                 if shutdown.load(Ordering::Acquire) {
-                    // Drain remaining commands
                     while let Ok(cmd) = consumer.pop() {
                         process_command(
                             cmd,

@@ -21,14 +21,12 @@ fn bench_e2e_crossing(c: &mut Criterion) {
                         ring::ring_buffer::<EngineCommand>(n.next_power_of_two() * 2);
                     let mut engine = MatchingEngine::with_capacity(n as u32 + 16);
 
-                    // Pre-fill: resting asks at price 100
                     for i in 1..=n as u64 {
                         engine
                             .add_order(make_order(i, i, Side::Ask, 100, 10))
                             .unwrap();
                     }
 
-                    // Queue crossing bids into the ring buffer
                     for i in 1..=n as u64 {
                         let cmd = EngineCommand::NewOrder(make_order(
                             n as u64 + i,
@@ -79,7 +77,7 @@ fn bench_e2e_mixed(c: &mut Criterion) {
     c.bench_function("e2e/mixed_100k", |b| {
         b.iter_batched(
             || {
-                let cap = 131_072; // next power of 2 above 100K
+                let cap = 131_072;
                 let (mut producer, consumer) =
                     ring::ring_buffer::<EngineCommand>(cap);
                 let engine = MatchingEngine::with_capacity(65_536);
@@ -90,7 +88,6 @@ fn bench_e2e_mixed(c: &mut Criterion) {
                 for i in 0..100_000u64 {
                     let action = i % 10;
                     let cmd = match action {
-                        // 60% non-crossing inserts
                         0..=5 => {
                             let side = if i % 2 == 0 { Side::Bid } else { Side::Ask };
                             let price = if side == Side::Bid { 100 } else { 200 };
@@ -99,7 +96,6 @@ fn bench_e2e_mixed(c: &mut Criterion) {
                             next_id += 1;
                             EngineCommand::NewOrder(order)
                         }
-                        // 20% cancels
                         6 | 7 => {
                             if let Some(id) = resting.pop() {
                                 EngineCommand::CancelOrder { order_id: id }
@@ -109,7 +105,6 @@ fn bench_e2e_mixed(c: &mut Criterion) {
                                 EngineCommand::NewOrder(order)
                             }
                         }
-                        // 20% crossing
                         _ => {
                             let order = make_order(next_id, next_id, Side::Bid, 200, 10);
                             next_id += 1;
@@ -165,14 +160,12 @@ fn bench_e2e_per_order(c: &mut Criterion) {
                 let mut report_buf = [0u8; EXECUTION_REPORT_SIZE];
                 let mut seq = 0u32;
 
-                // Pre-fill resting asks
                 for i in 1..=n as u64 {
                     engine
                         .add_order(make_order(i, i, Side::Ask, 100, 10))
                         .unwrap();
                 }
 
-                // Push crossing bids
                 for i in 1..=n as u64 {
                     producer
                         .push(EngineCommand::NewOrder(make_order(

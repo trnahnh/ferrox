@@ -429,7 +429,6 @@ mod tests {
         engine.add_order(ask_trader(1, 10, 100, 5, 1)).unwrap();
         engine.add_order(ask_trader(2, 20, 101, 10, 2)).unwrap();
 
-        // Fills against trader A, then hits own ask — cancelled
         let result = engine.add_order(bid_trader(3, 20, 101, 15, 3)).unwrap();
         assert_eq!(result.status, OrderStatus::CancelledSelfTrade);
         assert_eq!(result.fills.len(), 1);

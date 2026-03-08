@@ -17,7 +17,7 @@ use ferrox::metrics::LatencyRecorder;
 
 const ORDER_COUNT: usize = 1_000_000;
 const WARMUP_COUNT: usize = 10_000;
-const RING_CAPACITY: usize = 1 << 20; // 1M slots
+const RING_CAPACITY: usize = 1 << 20;
 const ARENA_CAPACITY: u32 = 1 << 20;
 
 fn make_order(id: u64, side: Side, price: i64, qty: u64) -> Order {
@@ -34,12 +34,9 @@ fn run_direct() {
         ring::ring_buffer::<EngineCommand>(RING_CAPACITY);
     let mut engine = MatchingEngine::with_capacity(ARENA_CAPACITY);
 
-    // Pre-generate orders: alternating ask (resting) then bid (crossing)
-    // Realistic price distribution: midpoint at 10000, spread +-50 ticks
     let total_pairs = ORDER_COUNT;
     let mut next_id = 1u64;
 
-    // Pre-fill resting asks at various price levels
     for i in 0..total_pairs {
         let price = 10000 + (i % 50) as i64;
         engine
@@ -48,7 +45,6 @@ fn run_direct() {
         next_id += 1;
     }
 
-    // Queue crossing bids into ring buffer
     for i in 0..total_pairs {
         let price = 10000 + (i % 50) as i64;
         let mut cmd = EngineCommand::NewOrder(make_order(next_id, Side::Bid, price, 10));
@@ -66,7 +62,6 @@ fn run_direct() {
 
     drop(producer);
 
-    // Warmup phase: process first WARMUP_COUNT orders without recording
     let mut report_buf = [0u8; EXECUTION_REPORT_SIZE];
     let mut seq = 0u32;
     let mut warmup_done = 0;
@@ -101,11 +96,9 @@ fn run_direct() {
 
     println!("Warmup complete ({warmup_done} orders)");
 
-    // Start allocation tracking
     #[cfg(feature = "alloc-track")]
     ferrox::alloc_track::start_tracking();
 
-    // Measured phase
     #[cfg(feature = "metrics")]
     let mut recorder = LatencyRecorder::new();
 
@@ -202,26 +195,20 @@ fn run_tcp() {
         snapshot_interval: 100_000,
     };
 
-    // Start gateway in background thread
     let gateway_handle = std::thread::spawn(move || {
         let _ = run(config);
     });
 
-    // Wait for gateway to start
     std::thread::sleep(Duration::from_millis(100));
 
-    // Set up UDP receiver
     let udp_recv = UdpSocket::bind(udp_addr).unwrap();
     udp_recv.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
 
     let total_pairs = ORDER_COUNT;
 
-    // Connect and send orders
     let send_start = std::time::Instant::now();
     {
         let mut stream = TcpStream::connect(tcp_addr).unwrap();
-
-        // Send resting asks then crossing bids
         let mut buf = [0u8; NEW_ORDER_SIZE];
         let mut next_id = 1u64;
 
@@ -240,11 +227,10 @@ fn run_tcp() {
             stream.write_all(&buf).unwrap();
             next_id += 1;
         }
-    } // TCP connection drops here, triggering gateway shutdown
+    }
 
     let send_elapsed = send_start.elapsed();
 
-    // Receive execution reports
     let mut recv_count = 0u64;
     let mut recv_buf = [0u8; EXECUTION_REPORT_SIZE];
     loop {
