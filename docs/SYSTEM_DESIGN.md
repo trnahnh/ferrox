@@ -476,7 +476,62 @@ Under sustained 1M orders/sec load for 60 seconds:
 
 ---
 
-## 13. Limitations and Future Work
+## 13. Cloud Deployment (UDP Subscriber / Gap-Recovery Path)
+
+The matching core (ingestion thread, ring buffer, matching engine, WAL) stays exactly where §11 puts it: pinned to isolated CPUs, in-process, on hardware the operator controls. None of that is a candidate for cloud deployment — the whole point of §5–§10 is avoiding scheduler jitter, network hops, and non-deterministic timing, all of which a shared cloud runtime reintroduces. The only component decoupled from the hot path is `examples/subscriber.rs`: an external consumer of `ExecutionReport` broadcasts that does gap detection over `seq_num` (§7.2). It doesn't touch the book, the arena, or the ring buffer — it's just a client of the multicast feed. That's the piece this section deploys.
+
+### 13.1 Lambda vs. Fargate
+
+**Lambda does not fit this workload, and it isn't close.** Lambda's execution model is invoke-per-event: a request (HTTP via API Gateway/ALB, a queue message, an S3 event, etc.) wakes a sandboxed execution environment, the handler runs to completion, and the environment is frozen or recycled. There is no AWS-native event source that delivers raw UDP datagrams to a Lambda invocation — the supported triggers are HTTP, queue/stream, and pub-sub integrations, none of which speak UDP. More fundamentally, the subscriber isn't a function that responds to discrete events; it's a **long-lived listener** — `UdpSocket::bind` once, `join_multicast_v4` once, then loop on `recv_from` forever, holding `expected_seq` in memory across every packet. Lambda's freeze/thaw lifecycle offers no guarantee that state (or the socket itself) survives between invocations, and there's no invocation boundary to hang packets off in the first place. Standing up a UDP listener inside a Lambda execution environment is architecturally incoherent, not just inconvenient — this isn't a "Lambda is slower" tradeoff, it's "Lambda has no mechanism for this."
+
+**Fargate fits directly.** A Fargate task is a long-running container with a real network interface that can `bind()` a UDP socket and hold it open indefinitely — the same execution model the subscriber already assumes. State (`expected_seq`, gap counters) lives in the process for as long as the task runs, exactly like it would on a bare-metal box. AWS Network Load Balancer supports UDP listeners with UDP target groups, so the deployment topology (NLB → Fargate task) is a direct lift of "expose a long-running UDP listener" rather than a workaround.
+
+**Decision: Fargate**, behind an NLB with a UDP listener, `ip` target type pointing at the task's ENI.
+
+### 13.2 Multicast Does Not Traverse a VPC — the Real Constraint
+
+Choosing Fargate does not make the deployment work by itself. AWS VPCs are a unicast-only fabric: there is no L2 broadcast/multicast domain the way an on-prem exchange LAN has one, so a plain `join_multicast_v4(239.1.1.1, ...)` inside a Fargate task's ENI **will not receive anything** — the packets never arrive at the ENI in the first place. This is the risk called out up front, and it's real. Three options, evaluated honestly:
+
+1. **AWS Transit Gateway Multicast.** A real, supported AWS feature — a TGW multicast domain can span VPC attachments. It does not, however, solve the actual gap here: the matching engine's UDP publisher runs outside AWS entirely (§11, pinned bare-metal), and TGW multicast only extends a multicast domain *between AWS networks*. Bridging an on-prem multicast source into a TGW domain still requires a Direct Connect or VPN path with multicast support, which most transit providers don't offer. It also adds a second piece of always-on infrastructure (the TGW multicast domain itself bills hourly) to solve a problem that a much simpler mechanism solves at the edge. Rejected as disproportionate to what's needed for a single decoupled subscriber.
+2. **VXLAN/L2 tunnel to extend the on-prem multicast domain into the VPC.** Technically possible, operationally fragile — a tunnel endpoint becomes a new single point of failure, adds its own latency and MTU considerations, and still needs multicast-aware routing at both ends. Rejected: too much surface area for what is fundamentally a one-subscriber problem.
+3. **Unicast relay at the network edge.** A small process, co-located on the same LAN segment as the matching engine (i.e., where multicast actually works), joins `239.1.1.1:9001` as an ordinary subscriber — using the exact same `join_multicast_v4` call `examples/subscriber.rs` already makes — and re-sends each raw `ExecutionReport` datagram via **unicast** UDP to the cloud endpoint. This is standard practice for bridging exchange multicast feeds to remote consumers (market data vendors do this at every colo-to-cloud boundary) and it requires zero changes to the matching engine, the gateway, or the multicast publisher — it's just another multicast subscriber that happens to forward what it receives.
+
+**Decision: unicast relay.** Added as a new standalone binary, `examples/relay.rs`, with no dependency on or modification to `src/gateway.rs`, `src/matching.rs`, or `src/ring.rs`. It joins the multicast group locally and forwards datagrams 1:1 via unicast UDP to a configured remote address (the NLB's UDP listener). `examples/subscriber.rs` itself was given one non-behavioral change: the multicast join is now conditional on an env var (`MULTICAST_GROUP`, unset by default), so the identical binary can run two ways — joining multicast on-prem (existing behavior, default), or binding as a plain UDP listener in Fargate to receive the relay's unicast stream. The decode path, gap-detection logic, and output format are untouched.
+
+```text
+[Matching Thread] ──multicast──► [on-prem subscribers]
+        │
+        └──multicast──► [relay: examples/relay.rs] ──unicast UDP──► [NLB :9001/udp] ──► [Fargate: subscriber.rs, unicast mode]
+```
+
+Caveat carried forward honestly: this relay is a new single point of failure on the recovery path, and it does not add any reliability the multicast feed itself lacks — if the relay drops a packet, the cloud subscriber sees the same gap the on-prem subscribers would have seen directly. It converts *reach* (on-prem LAN → internet), not *reliability*.
+
+### 13.3 Infrastructure
+
+Terraform (`infra/`), plain resource definitions:
+
+- `aws_ecr_repository` — holds the subscriber container image
+- `aws_ecs_cluster` + `aws_ecs_task_definition` (Fargate, awsvpc networking) + `aws_ecs_service`
+- `aws_lb` (`load_balancer_type = "network"`) + `aws_lb_listener` (UDP/9001) + `aws_lb_target_group` (`target_type = "ip"`, protocol UDP)
+- `aws_security_group` scoping inbound UDP/9001 to the relay's source, egress open
+- `aws_iam_role` for ECS task execution (`AmazonECSTaskExecutionRolePolicy`) — no custom permissions needed, the subscriber makes no AWS API calls
+- `aws_cloudwatch_log_group` for container stdout/stderr (the subscriber currently logs to stdout/stderr, not to a structured metrics sink — see §13.5 caveats)
+
+Default VPC and its existing subnets are used rather than provisioning a new VPC — this is a single decoupled subscriber, not a workload that needs network isolation from anything else in the account.
+
+### 13.4 Cost and Latency — Measured
+
+See `docs/CLOUD_DEPLOYMENT.md` for the measurement methodology and results (cost/hour, gap-detection latency added vs. in-process, cold-start behavior, and the EC2 always-on comparison). Numbers are recorded there rather than duplicated here so they can be updated independently of the architecture rationale above.
+
+### 13.5 Known Gaps (Documented, Not Hidden)
+
+- **No live exchange traffic crossed the relay in this exercise.** The matching engine runs on the operator's own hardware per §11 and was not stood up as a live multicast source reachable from this deployment's test environment. `examples/relay.rs` and the Fargate subscriber were validated with synthetic `ExecutionReport` traffic generated by a local test harness sending realistic unicast UDP at the deployed NLB endpoint — this measures the cloud leg (relay-egress-equivalent → NLB → Fargate → decode → gap-check) honestly, but does not include real on-prem multicast LAN behavior (IGMP join latency, LAN packet loss) upstream of the relay.
+- **The relay does not implement the retransmit-request half of §7.2/§9.3.** Today, `subscriber.rs` only *detects and logs* gaps; nothing in this codebase requests replay from a recovery service — §9.3's "Recovery: subscriber sends retransmit request" describes an unbuilt future component. Deploying the subscriber to Fargate does not change this: gaps introduced by the relay itself are made visible, not repaired.
+- **Multicast-in-VPC has no native fix used here.** §13.2 documents why Transit Gateway Multicast and VXLAN tunneling were rejected for this scope; either becomes worth revisiting if more than one cloud consumer needs the raw multicast feed rather than a single relayed unicast stream.
+
+---
+
+## 14. Limitations and Future Work
 
 **Current scope**: Single instrument, single matching engine instance.
 

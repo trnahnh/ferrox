@@ -84,6 +84,14 @@ Eliminated the last hot-path allocation: `AddOrderResult.fills` changed from `Ve
 
 4.7M orders/sec sustained throughput. Ring pop → match → encode execution report — the full hot path measured per order.
 
+### Cloud Deployment — The Decoupled Subscriber
+
+The matching core never leaves bare metal (pinned CPUs, in-process, no cloud — see [System Design §11](docs/SYSTEM_DESIGN.md#11-deployment-strategy)). The one piece that *is* decoupled — the UDP subscriber that does gap detection on the multicast execution-report feed — was actually deployed: containerized, pushed to ECR, and run on AWS Fargate behind a Network Load Balancer with real Terraform, in a real AWS account.
+
+Lambda doesn't fit a long-lived UDP listener (no event source delivers raw UDP, no persistent socket across invocations) — that's not a close call. Fargate does, directly. The real complication was networking: UDP multicast doesn't traverse a VPC, so the deployment uses a unicast relay at the network edge instead of trying to bridge multicast into AWS.
+
+Measured, not estimated: **~$0.041/hr** to run (70% of that is the NLB, not the compute — worth knowing before reaching for a load balancer), **45–70s** cold start dominated by NLB health-check convergence, and an honest dead end on cross-clock latency measurement from this environment (documented rather than papered over). Full writeup: [docs/CLOUD_DEPLOYMENT.md](docs/CLOUD_DEPLOYMENT.md). Architecture rationale: [System Design §13](docs/SYSTEM_DESIGN.md).
+
 ## Current State
 
 | Phase | Focus | Status |
@@ -112,6 +120,7 @@ cargo run --release --example loadgen --features metrics  # latency histogram
 - [System Design](docs/SYSTEM_DESIGN.md) — architecture, failure analysis, hardware considerations, deployment strategy
 - [Development Phases](docs/PHASES.md) — deliverables, stack choices, and rationale per phase
 - [Performance Metrics](docs/METRICS.md) — before/after benchmark numbers for every optimization
+- [Cloud Deployment](docs/CLOUD_DEPLOYMENT.md) — the decoupled subscriber on Fargate: measured cost, cold start, and what didn't work cleanly
 
 ## Contact
 
