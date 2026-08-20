@@ -40,4 +40,7 @@ harness = false
 name = "subscriber"
 
 [[example]]
+name = "relay"
+
+[[example]]
 name = "loadgen"

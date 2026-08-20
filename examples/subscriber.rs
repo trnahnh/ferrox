@@ -1,15 +1,50 @@
-use std::net::{Ipv4Addr, UdpSocket};
+use std::env;
+use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+use std::thread;
 
 use ferrox::protocol::{self, EXECUTION_REPORT_SIZE};
 
 fn main() {
-    let socket = UdpSocket::bind("0.0.0.0:9001").expect("failed to bind UDP socket");
+    // AWS NLB UDP target groups still require a TCP (or HTTP/HTTPS) health
+    // check — there's no way to health-check a bare UDP listener directly
+    // (see docs/SYSTEM_DESIGN.md §13.3). This is a pure NLB-satisfying stub:
+    // accept and drop, no relation to the ExecutionReport stream.
+    if let Ok(health_port) = env::var("HEALTH_PORT") {
+        thread::spawn(move || {
+            let port = health_port.parse::<u16>().expect("HEALTH_PORT must be a u16");
+            let listener = TcpListener::bind(("0.0.0.0", port)).expect("failed to bind health check listener");
+            eprintln!("subscriber: health check listener bound on 0.0.0.0:{port}");
+            for conn in listener.incoming() {
+                match conn {
+                    Ok(stream) => {
+                        eprintln!("subscriber: health check connection from {:?}", stream.peer_addr());
+                        drop(stream);
+                    }
+                    Err(e) => eprintln!("subscriber: health check accept error: {e}"),
+                }
+            }
+        });
+    }
 
-    socket
-        .join_multicast_v4(&Ipv4Addr::new(239, 1, 1, 1), &Ipv4Addr::UNSPECIFIED)
-        .expect("failed to join multicast group");
+    let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:9001".to_string());
+    let socket = UdpSocket::bind(&bind_addr).expect("failed to bind UDP socket");
 
-    eprintln!("subscriber: listening for execution reports on 239.1.1.1:9001");
+    // On-prem deployments join the exchange's multicast group directly (default).
+    // Cloud deployments (see docs/SYSTEM_DESIGN.md §13) sit behind a unicast relay
+    // instead, since UDP multicast doesn't traverse a VPC — set MULTICAST_GROUP=""
+    // (or leave unset with no local multicast source) to run in plain unicast mode.
+    match env::var("MULTICAST_GROUP") {
+        Ok(group) if !group.is_empty() => {
+            let addr: Ipv4Addr = group.parse().expect("MULTICAST_GROUP must be an IPv4 address");
+            socket
+                .join_multicast_v4(&addr, &Ipv4Addr::UNSPECIFIED)
+                .expect("failed to join multicast group");
+            eprintln!("subscriber: listening for execution reports on {bind_addr}, multicast group {group}");
+        }
+        _ => {
+            eprintln!("subscriber: listening for execution reports on {bind_addr} (unicast)");
+        }
+    }
 
     let mut buf = [0u8; EXECUTION_REPORT_SIZE];
     let mut expected_seq: u32 = 1;
