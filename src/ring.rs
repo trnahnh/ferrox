@@ -20,7 +20,7 @@
 //! RUSTFLAGS="--cfg ring_no_padding" cargo run --release --example ring_throughput
 //! ```
 use std::fmt;
-use std::mem::MaybeUninit;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ops::{Deref, DerefMut};
 
 #[cfg(not(loom))]
@@ -213,8 +213,44 @@ impl<T> Drop for RingBufferInner<T> {
     }
 }
 
+/// Shared ownership of the ring, dropped by value.
+///
+/// `Arc`'s own `Drop` hands `&mut self` to the out-of-line `Arc::drop_slow`.
+/// When a `Producer`/`Consumer` is a local variable, that call (which exists
+/// even if it only sits on the panic-cleanup path of the caller's loop) makes
+/// the address of the whole struct escape, so LLVM cannot promote
+/// `cached_head`/`cached_tail` to registers and every push/pop round-trips the
+/// cursors through the stack. Taking the `Arc` out by value in our own `Drop`
+/// means only a temporary's address is ever passed, and the hot-loop locals
+/// stay in registers. See docs/MEMORY_ORDERING.md §5 for the measurements.
+struct Shared<T>(ManuallyDrop<Arc<RingBufferInner<T>>>);
+
+impl<T> Shared<T> {
+    #[inline]
+    fn new(inner: Arc<RingBufferInner<T>>) -> Self {
+        Self(ManuallyDrop::new(inner))
+    }
+}
+
+impl<T> Deref for Shared<T> {
+    type Target = RingBufferInner<T>;
+    #[inline]
+    fn deref(&self) -> &RingBufferInner<T> {
+        &self.0
+    }
+}
+
+impl<T> Drop for Shared<T> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: `Drop::drop` runs exactly once and nothing reads `self.0`
+        // afterwards, so the `Arc` is moved out exactly once.
+        drop(unsafe { ManuallyDrop::take(&mut self.0) });
+    }
+}
+
 pub struct Producer<T> {
-    inner: Arc<RingBufferInner<T>>,
+    inner: Shared<T>,
     cached_head: usize,
     cached_tail: usize,
 }
@@ -255,7 +291,7 @@ impl<T> Producer<T> {
 }
 
 pub struct Consumer<T> {
-    inner: Arc<RingBufferInner<T>>,
+    inner: Shared<T>,
     cached_tail: usize,
     cached_head: usize,
 }
@@ -318,13 +354,13 @@ pub fn ring_buffer<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
     });
 
     let producer = Producer {
-        inner: Arc::clone(&inner),
+        inner: Shared::new(Arc::clone(&inner)),
         cached_head: 0,
         cached_tail: 0,
     };
 
     let consumer = Consumer {
-        inner,
+        inner: Shared::new(inner),
         cached_tail: 0,
         cached_head: 0,
     };
