@@ -84,6 +84,13 @@ pub fn recover_with_wal_size(
                 wal.truncate_to(offset, record_count_at_replay)?;
                 break;
             }
+            // A record whose CRC is valid but whose payload does not decode
+            // (`WalError::Protocol`) is not treated as the end of the log: the
+            // CRC says the bytes are what was written, so this is a writer bug,
+            // a foreign log or a 1-in-2^32 CRC collision, and starting with a
+            // guessed book is worse than not starting. Found by the fuzz target
+            // `wal_recover` on 2026-10-11 (one-byte payload 0xFF, CRC32
+            // 0xFF000000); see `crc_valid_undecodable_record_refuses_to_start`.
             Err(e) => return Err(RecoveryError::Wal(e)),
         }
     }
@@ -124,6 +131,49 @@ mod tests {
         let (engine, wal) = recover(&data_dir, 1024).unwrap();
         assert_eq!(engine.book().order_count(), 0);
         assert_eq!(wal.record_count(), 0);
+    }
+
+    /// Regression for the first fuzz finding (2026-10-11): a one-byte payload
+    /// `0xFF` has CRC32 `0xFF000000`, so the WAL accepts the record and the
+    /// protocol decoder rejects it. Recovery must return the protocol error
+    /// (not panic, not silently truncate), and must do so deterministically.
+    #[test]
+    fn crc_valid_undecodable_record_refuses_to_start() {
+        use crate::protocol::ProtocolError;
+
+        assert_eq!(crc32fast::hash(&[0xFF]), 0xFF00_0000);
+        // [payload_len = 1][crc32 = 0xFF000000][payload 0xFF][7 bytes padding]
+        let mut record = Vec::new();
+        record.extend_from_slice(&1u32.to_le_bytes());
+        record.extend_from_slice(&0xFF00_0000u32.to_le_bytes());
+        record.push(0xFF);
+        record.extend_from_slice(&[0u8; 7]);
+        assert_eq!(record.len(), 16);
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("wal.bin"), &record).unwrap();
+
+        // The WAL layer accepts the record: the CRC is valid.
+        let wal = Wal::open_with_size(&data_dir.join("wal.bin"), 1 << 16).unwrap();
+        assert_eq!(wal.record_count(), 1);
+        drop(wal);
+
+        for _ in 0..2 {
+            match recover_with_wal_size(&data_dir, 1024, Some(1 << 16)) {
+                Err(RecoveryError::Wal(WalError::Protocol(e))) => {
+                    assert_eq!(e, ProtocolError::UnknownMessageType(255));
+                }
+                Ok(_) => panic!("expected a protocol error, recovery succeeded"),
+                Err(e) => panic!("expected a protocol error, got {e:?}"),
+            }
+        }
+        // Recovery did not rewrite the log.
+        assert_eq!(
+            std::fs::read(data_dir.join("wal.bin")).unwrap()[..16],
+            record[..]
+        );
     }
 
     #[test]
