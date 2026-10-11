@@ -93,14 +93,13 @@ What this does and does not show:
   10–20%, minimums favor C++ by 5–10%, and the spread between two runs of the
   same binary is as large as the gap between languages. The transfer cost is
   cache-coherence traffic, which neither compiler can change.
-- **Single-threaded push+pop is faster in C++, by 1.5–3.5x depending on the
-  run.** This is a real, repeatable difference (C++ 1.1–1.8 ns vs Rust
-  2.3–4.0 ns across every run in this session), and it is the honest negative
-  result of the exercise. Part of it is the bounds check (section 4). The rest
-  is not pinned down here; candidates are the `Result<T, Empty>` return
-  convention versus the C++ out-parameter, and LLVM-vs-GCC scheduling of the
-  tight loop. It does not show up in the two-thread numbers because there the
-  loop is waiting on cache lines, not on instructions.
+- **Single-threaded push+pop was faster in C++, by 1.5–3.5x depending on the
+  run** (C++ 1.1–1.8 ns vs Rust 2.3–4.0 ns across every run in this session).
+  On 2026-10-10 this was reported as unexplained, with the `Result` return
+  convention and LLVM-vs-GCC scheduling as candidates. Both guesses were
+  wrong; section 5 has the actual cause (a register-promotion failure caused
+  by how `Arc` is dropped) and the fix. It never showed up in the two-thread
+  numbers because there the loop waits on cache lines, not on instructions.
 - GCC was used for C++ and LLVM for Rust, so this is also a GCC-vs-LLVM
   comparison. `CXX=clang++ scripts/asm_ordering.sh` and
   `clang++ -O3 cpp/bench_ring.cpp` give the LLVM-vs-LLVM view on a machine
@@ -127,6 +126,70 @@ measurable across threads (the unchecked build was slower there in all three
 runs, which is within this harness's noise, not a real effect). Conclusion:
 keep the check. It closes some but not all of the gap to C++ in section 3, and
 it is free where the ring actually runs, between two cores.
+
+## 5. The single-thread gap, explained and closed (2026-10-11)
+
+`scripts/asm_loop.sh` compiles the exact `run_latency` loop of both harnesses
+out of line (`latency_bench` in `scripts/asm_probe.rs` and `cpp/asm_probe.cpp`)
+and writes the bodies to [`docs/asm/`](asm/). Reading them side by side:
+
+| | g++ 14.2 `latency_bench` | rustc 1.93 `latency_bench`, before | rustc 1.93, after the fix |
+| --- | --- | --- | --- |
+| where the four cursor fields live during the loop | registers (`rax`, `r10`, `rdx`, `r11`) | the stack: every iteration loads and stores `cached_head`, `cached_tail`, and reloads the `Arc` pointer | registers (`r8+rbx`, `r10`, `r11`, `r9+rbx`) |
+| loads + stores to the producer/consumer structs per iteration | 0 | 11 | 0 |
+| loop body instructions | 25 | 38 | 38, of which 6 are the two bounds checks |
+
+The before-loop has a loop-carried dependency through memory: the cursor is
+stored to the stack at the end of one iteration and loaded back at the start
+of the next, which costs a store-to-load forwarding latency (about 4–5 cycles
+on Zen 3) on the critical path, where GCC's version has a 1-cycle register
+dependency. That, not instruction count, is the 1.5–3.5x.
+
+**Why LLVM kept the fields in memory.** The LLVM IR (`rustc --emit llvm-ir`)
+shows the `Producer`/`Consumer` allocas passed by pointer to
+`alloc::sync::Arc::drop_slow`, in the panic-cleanup block of the loop (any
+`unwrap()` or bounds check can unwind, and unwinding must drop the two
+locals). `Arc`'s `Drop` calls the out-of-line `drop_slow(&mut self)`, and
+`&mut self.inner` is the address of the containing struct. Once an alloca's
+address escapes into a call, SROA/mem2reg will not promote any of its fields.
+Three experiments pin this down:
+
+| build of the probe | cursors in registers? |
+| --- | --- |
+| default | no |
+| `-C panic=abort` (no cleanup block; `drop_slow` now called on the normal exit path) | no |
+| `-C panic=abort` + `mem::forget` the ring (no `drop_slow` call at all) | **yes** |
+
+GCC's `shared_ptr` release passes the *control block* pointer (loaded from the
+field) to its cold path, never the address of the local, so the C++ locals
+were never pinned.
+
+**Fix** (`src/ring.rs`, `Shared<T>`): the `Arc` is held in a `ManuallyDrop`
+and dropped by value from an explicit `Drop` impl, so the only address that
+reaches `drop_slow` is a temporary's. The push/pop functions are unchanged
+(`docs/asm/rust_ring_acqrel.s` differs only in label numbers; 64
+instructions, fence census unchanged) and loom still passes.
+
+**Measured** (Windows, same session, 10 × 1M push+pop pairs per run, three
+rounds, each round running the three binaries back to back):
+
+| round | Rust before, median ns | Rust after, median ns | C++ (g++), median ns |
+| --- | --- | --- | --- |
+| 1 | 2.853 | 1.592 | 1.742 |
+| 2 | 3.486 | 2.810 | 1.751 |
+| 3 | 3.627 | 2.122 | 1.467 |
+
+The pinned, 40-sample, statistically tested version of this comparison (Linux
+and Windows) is in [METHODOLOGY.md](METHODOLOGY.md) and
+[ROUND2_REPORT.md](../ROUND2_REPORT.md). Remaining difference, if any, is the
+bounds check of section 4.
+
+The general lesson is portable beyond this ring: in Rust, a hot loop over a
+local that owns an `Arc` (or anything whose `Drop` takes `&mut self` into an
+out-of-line function) can silently lose register promotion for *all* of that
+local's fields. The symptom is a loop that stores a counter to the stack and
+reloads it on the next iteration; the diagnosis is `--emit llvm-ir` and a
+search for the alloca being passed to a call.
 
 ## Reproduce
 

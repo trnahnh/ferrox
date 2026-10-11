@@ -85,7 +85,7 @@ Eliminated the last hot-path allocation: `AddOrderResult.fills` changed from `Ve
 
 Ring pop → match → encode execution report, measured per order over 990,000 orders (about 63% fill, 37% rest in the book). Throughput is 3.21–4.01M orders/sec with two clock reads per order for the histogram and 4.36–4.41M orders/sec without timing.
 
-The earlier published figures (P50/P90/P99 = 100/200/500 ns, 4.7M/s) were taken with `std::time::Instant`, which on Windows advances in 100 ns steps, so each percentile was quantized to that grid. The load generator now uses the x86-64 timestamp counter (0.3 ns step) and prints the clock step it observed; `--instant` reproduces the old method. Details in [docs/VERIFICATION.md §5](docs/VERIFICATION.md#5-measurement-checks-that-came-out-of-the-audit).
+The earlier published figures (P50/P90/P99 = 100/200/500 ns, 4.7M/s) were taken with `std::time::Instant`, which on Windows advances in 100 ns steps, so each percentile was quantized to that grid. The load generator now uses the x86-64 timestamp counter (0.3 ns step) and prints the clock step it observed; `--instant` reproduces the old method. Details in [docs/VERIFICATION.md §5](docs/VERIFICATION.md#6-measurement-checks-that-came-out-of-the-audit).
 
 ### Phase 8 — Verify It (Memory Model, Differential Tests, C++ Port)
 

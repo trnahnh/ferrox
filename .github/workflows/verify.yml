@@ -1,11 +1,8 @@
-# Verification jobs that need a Linux toolchain and therefore cannot run on the
-# Windows development machine: Miri (undefined-behaviour detection in the
-# unsafe slot code), ThreadSanitizer for the Rust ring, ThreadSanitizer /
-# AddressSanitizer / UndefinedBehaviorSanitizer for the C++ port, plus the
-# portable checks (unit + property tests, loom model checking) for completeness.
-#
-# Status: written on Windows and NOT executed locally; the first push of this
-# branch is the first run. See ENHANCEMENT_REPORT.md.
+# Verification jobs that need a Linux toolchain. Every command here was run by
+# hand in WSL2 Ubuntu 24.04 on 2026-10-11 (scripts/wsl_queue.sh is the exact
+# sequence; results in docs/VERIFICATION.md and ROUND2_REPORT.md). The
+# workflow itself has not been executed on GitHub Actions: this repository has
+# not been pushed since it was written.
 name: verify
 
 on:
@@ -17,12 +14,14 @@ env:
 
 jobs:
   test:
-    name: unit + property tests (stable)
+    name: unit, property and crash-consistency tests (stable)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --features metrics
+      # crash_recovery re-executes the test binary and kills it; keep it
+      # single-threaded so the kill timing is meaningful.
+      - run: cargo test --release --features metrics -- --test-threads=1
 
   loom:
     name: loom model check (SPSC ring)
@@ -40,35 +39,49 @@ jobs:
           fi
 
   miri:
-    name: miri (unsafe slot code, single-threaded)
+    name: miri (ring, single-threaded tests)
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: verify/ring-standalone
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri, rust-src
-      - run: cargo miri setup
-      # The concurrent unit tests move 100k items each; under Miri's
-      # interpreter that takes minutes, and cross-thread ordering is already
-      # covered by loom and TSan. Everything else in the ring module runs.
-      - run: cargo miri test --lib ring:: -- --skip concurrent_
+      # verify/ring-standalone includes src/ring.rs by path with no
+      # dependencies, so Miri only interprets the ring and std. The 100k-item
+      # concurrent tests are skipped: minutes under the interpreter, and the
+      # cross-thread ordering is covered by loom and TSan.
+      - run: cargo miri test -- --skip concurrent_
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
 
   tsan-rust:
     name: ThreadSanitizer (Rust ring)
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: verify/ring-standalone
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
-      - run: >
-          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu
-          --lib ring:: -- --test-threads=1
+      - name: shipped ordering must be race-free
+        run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu -- --test-threads=1
         env:
           RUSTFLAGS: -Zsanitizer=thread
-          RUSTDOCFLAGS: -Zsanitizer=thread
+      - name: relaxed ordering must be caught (negative control)
+        run: |
+          if RUSTFLAGS="-Zsanitizer=thread --cfg ring_relaxed_ordering --cfg ring_allow_unsound" \
+             cargo test -Zbuild-std --target x86_64-unknown-linux-gnu -- --test-threads=1 concurrent_ 2>&1 \
+             | tee tsan_relaxed.log | grep -q "ThreadSanitizer: data race"; then
+            echo "negative control OK: TSan reported the race"
+          else
+            echo "TSan did not report the data race in the relaxed-ordering ring" >&2
+            exit 1
+          fi
 
   cpp-sanitizers:
     name: C++ ring under TSan, ASan, UBSan
@@ -84,13 +97,29 @@ jobs:
           clang++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -pthread cpp/test_ring.cpp -o test_asan
           ./test_asan
       - name: relaxed ordering must be caught by TSan (negative control)
+        # TSan exits 66 when it has reported a race (verified in WSL: 66 with
+        # the Relaxed build, 0 with the shipped one).
         run: |
           clang++ -std=c++20 -O1 -g -fsanitize=thread -pthread -DFERROX_RELAXED_UNSOUND cpp/test_ring.cpp -o test_tsan_relaxed
           if ./test_tsan_relaxed; then
             echo "TSan did not report the data race in the relaxed-ordering ring" >&2
             exit 1
           fi
-      - name: plain build and benchmark smoke test
+      - name: plain build and benchmark smoke test (g++ and clang++)
         run: |
-          g++ -std=c++20 -O3 -pthread cpp/bench_ring.cpp -o bench_ring
-          ./bench_ring 3 100000
+          g++ -std=c++20 -O3 -pthread cpp/bench_ring.cpp -o bench_ring_gcc && ./bench_ring_gcc 3 100000
+          clang++ -std=c++20 -O3 -pthread cpp/bench_ring.cpp -o bench_ring_clang && ./bench_ring_clang 3 100000
+
+  fuzz:
+    name: fuzz targets build and run briefly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      # 60 seconds per target here; the 10-minute runs and the coverage
+      # report are documented in docs/VERIFICATION.md.
+      - run: |
+          for t in protocol_decode wal_recover snapshot_load; do
+            cargo fuzz run "$t" -- -max_total_time=60 -print_final_stats=1
+          done

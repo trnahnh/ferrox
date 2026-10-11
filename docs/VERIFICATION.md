@@ -126,7 +126,76 @@ workflow, [`.github/workflows/verify.yml`](../.github/workflows/verify.yml):
 is its first run; any failure there is a finding to record, not something to
 paper over.
 
-## 5. Measurement checks that came out of the audit
+## 5. Crash consistency: fault injection of the WAL and snapshots (2026-10-11)
+
+Phase 6 claimed "truncate WAL at random points, verify correct recovery". That
+was one hand-written unit test per failure mode. `tests/crash_recovery.rs`
+replaces it with an exhaustive harness built on three rules a recovery must
+satisfy after *any* crash: never panic; yield exactly the longest valid prefix
+of the log; and produce the same book as replaying that prefix into a fresh
+engine, whether or not a snapshot was used.
+
+The command stream is a pure function of `(seed, index)` (splitmix-style hash:
+~75% new orders in an 11-tick band across four trader ids, ~25% cancels of
+earlier ids), so any process can regenerate exactly what another one wrote.
+
+| test | faults injected | cases | result |
+| --- | --- | --- | --- |
+| `wal_truncated_at_every_byte_offset_…` | log cut at every byte offset 0..=624 of a 16-record log; after recovery, 3 more records are appended, the process exits, and recovery runs again | 625 | 0 failures |
+| `wal_corrupted_at_every_byte_offset_…` | byte xor 0xFF, byte zeroed, bit 0 flipped, at every offset, each followed by the same append-and-recover-again step | 1,548 | **698 failures before the fix**, 0 after |
+| `snapshot_corrupted_at_every_byte_offset_…` | the same three mutations at every offset of a 566-byte snapshot, with a 40-record WAL whose first 25 records the snapshot covers | 1,189 | **16 failures before the fix**, 0 after |
+| `killed_writer_recovers_to_a_consistent_prefix` | a writer process (this test binary re-executed) appends and snapshots; it is `kill`ed at a varying point, recovery runs, the writer is restarted and resumes from the recovered state; 12 cycles | 12 kills, 2,368 records | 0 failures |
+
+Two real defects, both fixed in this branch:
+
+1. **Stale records resurrected after a corrupt record** (`src/wal.rs`).
+   Recovery stopped at the first bad record and set the write position there,
+   but left the bytes after it untouched. Those bytes still held the *old*
+   records. New appends overwrote them from the front; as soon as the new
+   records realigned with the old record boundaries (immediately, since every
+   `NewOrder` record is 48 bytes), the next recovery read straight through the
+   new records into the old ones and brought back history the previous
+   recovery had declared lost. The harness shows it as "after appending 3,
+   recovered 16 records, expected 3". Fix: `Wal::open` truncates the file to
+   the end of the valid prefix and re-extends it, which costs two metadata
+   syscalls and makes everything past `write_pos` read as zero, the invariant
+   the rest of the module now relies on.
+2. **Snapshot checksum did not cover its own header** (`src/snapshot.rs`). The
+   CRC32 was computed over `orders` only, so a corrupted `wal_record_count`
+   passed verification and replay started from the wrong record: 16 cases,
+   exactly the bytes 0–7 of the file. Fix: the checksum covers every field.
+   Corruption of `best_bid`/`best_ask` was harmless (restore recomputes them)
+   and is now also detected.
+
+Two observations that are not defects:
+
+- Cutting a record inside its trailing zero bytes (the high bytes of a small
+  quantity) yields a file that is byte-identical to the intact one after the
+  WAL zero-extends it, so the record correctly survives. 112 of the 625
+  truncation offsets are of this kind; the oracle compares bytes, not lengths.
+- On Windows the first version of the kill test landed every kill inside
+  `Snapshot::save` (the record count was a multiple of the snapshot interval
+  in all 12 cycles) because `fs::write` + `rename` dominates the writer's wall
+  time there. The interval was raised so kills land in both regions; the test
+  prints how many hit each. Each kill during a save leaves a
+  `snapshot_*.bin.tmp` behind, which the loader ignores by name; they are not
+  cleaned up.
+
+Not covered, and therefore not claimed: durability across *power loss*. The WAL
+is an `mmap` with no `msync` ordering and the snapshot does no `fsync` before
+`rename`, so a kernel crash or power cut can lose or reorder page writeback in
+ways a process kill cannot. The harness proves process-crash consistency only.
+
+```text
+$ cargo test --release --test crash_recovery -- --nocapture --test-threads=1
+wal truncation: 625 cases, 0 failures
+wal corruption: 1548 cases, 0 failures
+snapshot corruption: 1189 cases, 0 failures
+process-kill: 12 cycles, 2368 records total, ...
+test result: ok. 5 passed; finished in 54.61s        (Windows, release)
+```
+
+## 6. Measurement checks that came out of the audit
 
 - `std::time::Instant` on this Windows machine advances in 100 ns steps
   (QueryPerformanceCounter at 10 MHz, measured: 1.49M of 5M consecutive reads
