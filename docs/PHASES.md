@@ -209,4 +209,34 @@
 
 **Results**: see [VERIFICATION.md](VERIFICATION.md) and [MEMORY_ORDERING.md](MEMORY_ORDERING.md). Headlines: SeqCst costs 5.4–6.0x on u64 transfer; false sharing 2x; no cursor cache 1.4–1.7x; cross-thread Rust vs C++ is a tie within noise; single-threaded push+pop is 1.5–3.5x faster in C++, of which the bounds check accounts for 10–25%.
 
-**Status**: Complete except the sanitizer CI, which has been written but not run.
+**Status**: Complete. The sanitizer jobs were run by hand on Linux in Phase 9.
+
+---
+
+## Phase 9: Crash Consistency, Statistics, Linux Verification
+
+**Objective**: Make the evidence from Phase 8 hold up to a reviewer who probes every number: run the sanitizers that were only written, settle the Rust-vs-C++ question with statistics instead of two runs, find the root cause of the single-thread gap, and attack the persistence layer with faults instead of hand-picked cases.
+
+**Deliverables**:
+
+- `tests/crash_recovery.rs`: truncation and three corruption patterns at every byte offset of a WAL and of a snapshot, each followed by "keep writing, recover again"; a writer process killed mid-write over repeated cycles. Two defects found and fixed (stale-record resurrection in `Wal::open`; snapshot checksum not covering `wal_record_count`).
+- `fuzz/`: cargo-fuzz targets for the wire-protocol decoder (with encode/decode round-trip properties), arbitrary bytes as a WAL, and arbitrary bytes as a snapshot.
+- `examples/ring_throughput.rs`, `cpp/bench_ring.cpp`: `--pin P,C`, `--raw`, `--workload`; `scripts/bench_compare.py`: interleaved A/B driver with bootstrap CIs, Mann-Whitney U and Cliff's delta; `scripts/perf_counters.sh`: `perf stat` over the ring variants.
+- `src/ring.rs`: `Shared<T>` (a `ManuallyDrop<Arc<_>>` dropped by value) so the producer/consumer cursors stay in registers; `scripts/asm_loop.sh` and `docs/asm/*latency*` show the loop bodies that prove it.
+- `verify/ring-standalone`: zero-dependency crate that includes `src/ring.rs` by path for Miri and `-Zbuild-std` ThreadSanitizer; `--cfg ring_allow_unsound` for sanitizer negative controls.
+- `scripts/wsl_queue.sh`: the exact Linux sequence that was run; `.github/workflows/verify.yml` mirrors it.
+- `docs/METHODOLOGY.md`: how every benchmark is run and how much noise to expect.
+
+**Stack**:
+
+| Component | Choice | Rationale |
+| --- | --- | --- |
+| Fault injection | hand-rolled, in `cargo test` | every byte offset is enumerable for a small log; a pure-function command stream lets a killed process be resumed and checked |
+| Fuzzing | `cargo-fuzz` (libFuzzer) | coverage-guided; round-trip properties turn a crash-only target into a correctness oracle |
+| Statistics | pure-Python bootstrap, Mann-Whitney, Cliff's delta | distribution-free (the data are skewed); no numpy/scipy so the environment is reproducible |
+| Pinning | `sched_setaffinity` / `SetThreadAffinityMask` via raw FFI | no new crate; two distinct physical cores |
+| Counters | `perf stat` (Linux) | the only user-space PMU access on this machine |
+
+**Results**: [VERIFICATION.md §4–5](VERIFICATION.md), [MEMORY_ORDERING.md §5](MEMORY_ORDERING.md#5-the-single-thread-gap-explained-and-closed-2026-10-11), [METHODOLOGY.md §5–6](METHODOLOGY.md), [ROUND2_REPORT.md](../ROUND2_REPORT.md).
+
+**Status**: Complete, with the Linux steps that the memory-starved WSL2 VM could not finish listed as unverified in the report.

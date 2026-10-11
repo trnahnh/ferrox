@@ -1,9 +1,10 @@
 # Verification
 
-How the two pieces of Ferrox that are easiest to get subtly wrong, the lock-free
-ring and the matching logic, are checked beyond unit tests. Everything in
-sections 1–3 was run on 2026-10-10 on Windows; section 4 is a CI workflow that
-needs Linux and has not been executed yet.
+How the three pieces of Ferrox that are easiest to get subtly wrong, the
+lock-free ring, the matching logic and the crash-recovery path, are checked
+beyond unit tests. Sections 1–3 were run on 2026-10-10 on Windows; section 4
+(sanitizers, Miri) was run on 2026-10-11 in WSL2 Ubuntu; section 5 (fault
+injection) on 2026-10-11 on Windows and Linux.
 
 ## 1. Model checking the ring with loom
 
@@ -100,31 +101,48 @@ The README's "6 unsafe blocks" undercounted. Actual inventory of the default
 
 | file | `unsafe` blocks | `unsafe impl` | what they do |
 | --- | --- | --- | --- |
-| `src/ring.rs` | 6 | 3 | 3 primitive slot operations (`write`, `read`, `drop_in_place`) each in an `unsafe fn` on `Slot<T>` with its contract, plus the 3 call sites in `push`, `pop`, `Drop`; `Send`/`Send`/`Sync` for producer/consumer/inner. One more block exists only under `--cfg ring_unchecked_index`. |
+| `src/ring.rs` | 7 | 3 | 3 primitive slot operations (`write`, `read`, `drop_in_place`) each in an `unsafe fn` on `Slot<T>` with its contract, plus the 3 call sites in `push`, `pop`, `Drop`; `ManuallyDrop::take` in `Shared::drop` (runs once, by construction of `Drop`); `Send`/`Send`/`Sync` for producer/consumer/inner. One more block exists only under `--cfg ring_unchecked_index`. |
 | `src/wal.rs` | 2 | 0 | `MmapMut::map_mut` |
 | `src/alloc_track.rs` | 2 | 1 | delegation to `System` in the tracking `GlobalAlloc` (compiled unconditionally; only installed as the global allocator by `loadgen` under `--features alloc-track`) |
 
 The slot operations are what loom checks for races and what the Miri job
 below checks for undefined behaviour.
 
-## 4. Sanitizers and Miri (CI, not yet run)
+## 4. Sanitizers and Miri (run on Linux, 2026-10-11)
 
-ThreadSanitizer, AddressSanitizer, UndefinedBehaviorSanitizer and Miri all
-need a Linux toolchain (Rust TSan is Linux-only; MinGW g++ ships no sanitizer
-runtime; WSL on the dev machine has no compilers installed). Rather than
-install toolchains outside the repository, the checks are a GitHub Actions
-workflow, [`.github/workflows/verify.yml`](../.github/workflows/verify.yml):
+ThreadSanitizer, AddressSanitizer, UndefinedBehaviorSanitizer and Miri need a
+Linux toolchain (Rust TSan is Linux-only; MinGW g++ ships no sanitizer
+runtime). Round 1 left them as an unexecuted CI workflow. Round 2 installed
+the toolchain inside WSL2 Ubuntu 24.04 (gcc 13.3, clang 18.1.3, rustup
+stable 1.99 + nightly 1.101 with miri/rust-src) and ran them by hand;
+[`scripts/wsl_queue.sh`](../scripts/wsl_queue.sh) is the exact sequence and
+[`.github/workflows/verify.yml`](../.github/workflows/verify.yml) mirrors it.
+The VM has 3.9 GB shared with Docker Desktop containers that held ~3.5 GB,
+so every cargo build there swapped; which steps completed is recorded
+honestly below and in [ROUND2_REPORT.md](../ROUND2_REPORT.md).
 
-| job | command | purpose |
+| check | command (see queue script) | result |
 | --- | --- | --- |
-| `miri` | `cargo miri test --lib ring:: -- --skip concurrent_` | interpret the unsafe slot code; flags uninitialized reads, invalid pointers, double drops |
-| `tsan-rust` | `RUSTFLAGS=-Zsanitizer=thread cargo test -Zbuild-std --lib ring::` | dynamic data-race detection on the real concurrent unit tests |
-| `cpp-sanitizers` | `clang++ -fsanitize=thread`, then `-fsanitize=address,undefined` on `cpp/test_ring.cpp` | same for the C++ port |
-| negative controls | loom and TSan on the `Relaxed` variants | the workflow fails if either tool stops detecting the race |
+| C++ ThreadSanitizer | `clang++ -std=c++20 -O1 -g -fsanitize=thread -pthread cpp/test_ring.cpp` | **6 tests ok, no report, exit 0** |
+| C++ ASan + UBSan | `clang++ … -fsanitize=address,undefined -fno-omit-frame-pointer` | **6 tests ok, no report, exit 0** |
+| C++ TSan negative control | same, `-DFERROX_RELAXED_UNSOUND` | **caught**: `WARNING: ThreadSanitizer: data race … spsc_ring.hpp:175:13 in Consumer::pop` (the slot read racing the producer's slot write), 2 reports, exit 66 |
+| Rust Miri (ring, single-threaded tests) | `cd verify/ring-standalone && MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri test -- --skip concurrent_` | see ROUND2_REPORT.md §3 (filled in from the queue log) |
+| Rust ThreadSanitizer (ring, concurrent tests) | `cd verify/ring-standalone && RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu` | see ROUND2_REPORT.md §3 |
+| Rust TSan negative control | same with `--cfg ring_relaxed_ordering --cfg ring_allow_unsound`, must print `ThreadSanitizer: data race` | see ROUND2_REPORT.md §3 |
+| loom on Linux + negative control | `RUSTFLAGS="--cfg loom" cargo test --release --test loom_ring` | see ROUND2_REPORT.md §3 (passes on Windows, §1) |
 
-**Status: written on Windows, never executed.** The first push of this branch
-is its first run; any failure there is a finding to record, not something to
-paper over.
+Why `verify/ring-standalone` exists: `-Zbuild-std` rebuilds the standard
+library with TSan and Miri interprets every instruction, so both are run on a
+crate that contains nothing but `src/ring.rs` (included by `#[path]`, not
+copied) rather than on the main crate with criterion and proptest behind it.
+It is the same module and the same 13 tests.
+
+One operational note from running this for real: the exit code of a
+sanitizer run only means something when read in the same shell that ran it.
+Driving WSL from a Windows shell expanded `$?` on the Windows side, which made
+the Relaxed build look like it exited 0; a script file run inside WSL gave the
+true codes (66 with a race, 0 without). The CI step relies on that exit code
+and is therefore correct, but it was checked rather than assumed.
 
 ## 5. Crash consistency: fault injection of the WAL and snapshots (2026-10-11)
 

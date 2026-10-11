@@ -316,3 +316,47 @@ Rust-vs-C++ comparison, the cost of SeqCst, false sharing, cursor caching and bo
 | --- | --- | --- |
 | Test count | 137 (with `--features metrics`) | 141 (+3 differential book tests, +1 ring model test); +4 loom tests under `--cfg loom`; +6 C++ tests |
 | Test time | ~0.25s | ~0.2s unit + ~2.5s property tests; loom ~5.5s |
+
+---
+
+## Round 2 (2026-10-11)
+
+Same laptop; this time the WSL2 VM on the host was swapping throughout (its 3.9 GB are shared with Docker Desktop containers), which widened every confidence interval compared with a quiet machine. Conditions, method and raw samples: [METHODOLOGY.md](METHODOLOGY.md), [bench/](bench/).
+
+### Single-thread push+pop: root cause fixed
+
+`src/ring.rs` kept the producer/consumer cursors on the stack because `Arc`'s drop pins the containing struct in memory ([MEMORY_ORDERING.md §5](MEMORY_ORDERING.md#5-the-single-thread-gap-explained-and-closed-2026-10-11)). Pinned to cores 2 and 4, 10 interleaved rounds × 4 trials (n = 40), Windows, run 1:
+
+| variant | median ns per push+pop | 95% CI | vs fixed Rust | p (Mann-Whitney) |
+| --- | --- | --- | --- | --- |
+| Rust, before fix | 2.752 | [2.546, 3.083] | 1.710x slower [1.552, 1.916] | 1.4e-14 |
+| Rust, after fix | 1.610 | [1.546, 1.708] | baseline | |
+| C++ (g++ 14.2, -O3) | 1.196 | [1.159, 1.236] | 0.743x [0.691, 0.781] | 3.9e-10 |
+| Rust, after fix, no bounds check (run 2, unpinned) | 1.942 vs 2.075 default | | 0.936x [0.702, 1.091] | 0.045 (not significant in that run) |
+| Rust, after fix, no bounds check (run 2, pinned) | 1.909 vs 2.679 default | | 0.712x [0.588, 0.949] | 0.0012 |
+
+Round 1 reported 1.5–3.5x in favor of C++ from two unpinned runs each; with n = 40 the before-fix gap is 2.3x and the after-fix gap 1.35x.
+
+### Cross-thread transfer, Rust vs C++ (same runs)
+
+| workload | Rust median | C++ median | ratio [CI] | p | verdict |
+| --- | --- | --- | --- | --- | --- |
+| u64 / 1M, pinned run 1 | 5.458 ms | 5.616 ms | 1.029 [0.960, 1.104] | 0.31 | tie |
+| u64 / 1M, pinned run 2 | 7.111 ms | 7.760 ms | 1.091 [0.940, 1.346] | 0.95 | tie |
+| u64 / 1M, unpinned run 2 | 4.127 ms | 4.943 ms | 1.198 [1.059, 1.377] | 0.0004 | Rust faster in this run only |
+| Order48 / 1M, pinned run 1 | 12.553 ms | 14.080 ms | 1.122 [1.074, 1.189] | 8.5e-05 | Rust faster |
+| Order48 / 1M, pinned run 2 | 14.142 ms | 16.609 ms | 1.174 [1.043, 1.323] | 0.0014 | Rust faster |
+| Order48 / 1M, unpinned run 2 | 11.682 ms | 12.920 ms | 1.106 [1.039, 1.180] | 0.0031 | Rust faster |
+
+The register-promotion fix also moved the cross-thread Order48 number (before fix 14.494 ms vs after 12.553 ms in run 1, ratio 1.155 [1.102, 1.214], p = 2.3e-06) and left u64 unchanged (1.045 [0.949, 1.120], p = 0.90).
+
+### Crash consistency
+
+`cargo test --release --test crash_recovery`: 625 truncation offsets, 1,548 corruption cases, 1,189 snapshot-corruption cases, 12 process kills; 0 failures after the two fixes ([VERIFICATION.md §5](VERIFICATION.md#5-crash-consistency-fault-injection-of-the-wal-and-snapshots-2026-10-11)). Before the fixes: 698 and 16 failures respectively.
+
+### Test Suite (Phase 8→9)
+
+| Metric | Phase 8 | Phase 9 |
+| --- | --- | --- |
+| Test count | 141 (with `--features metrics`) | 147 (+5 crash-consistency, +1 snapshot checksum); +4 loom; +6 C++; +13 ring tests again in `verify/ring-standalone`; 3 fuzz targets |
+| Test time | ~0.2s unit + ~2.5s property | + 55–75 s for `crash_recovery` on Windows (NTFS temp-dir churn; seconds on Linux) |
