@@ -60,8 +60,8 @@ step nightly_install bash -c 'rustup toolchain install nightly --profile minimal
 step miri bash -c 'cd verify/ring-standalone && MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test -- --skip concurrent_'
 
 # 6. ThreadSanitizer on the real concurrent ring tests (rebuilds std with TSan).
-step tsan_rust bash -c 'cd verify/ring-standalone && RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu -- --test-threads=1'
-step tsan_rust_relaxed_negative bash -c 'cd verify/ring-standalone && if RUSTFLAGS="-Zsanitizer=thread --cfg ring_relaxed_ordering --cfg ring_allow_unsound" cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu -- --test-threads=1 concurrent_ 2>&1 | tee /dev/stderr | grep -q "ThreadSanitizer: data race"; then echo "negative control OK: TSan reported the race"; else echo "NEGATIVE CONTROL: TSan did not report a race (or the build failed; see above)"; exit 1; fi'
+step tsan_rust bash -c 'cd verify/ring-standalone && RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test --lib -Zbuild-std --target x86_64-unknown-linux-gnu -- --test-threads=1'
+step tsan_rust_relaxed_negative bash -c 'cd verify/ring-standalone && if RUSTFLAGS="-Zsanitizer=thread --cfg ring_relaxed_ordering --cfg ring_allow_unsound" cargo +nightly test --lib -Zbuild-std --target x86_64-unknown-linux-gnu -- --test-threads=1 concurrent_ 2>&1 | tee /dev/stderr | grep -q "ThreadSanitizer: data race"; then echo "negative control OK: TSan reported the race"; else echo "NEGATIVE CONTROL: TSan did not report a race (or the build failed; see above)"; exit 1; fi'
 
 # 7. cargo-fuzz: install, 10 minutes per target, coverage for the protocol decoder.
 step fuzz_install bash -c 'cargo +nightly install cargo-fuzz --locked 2>&1 | tail -3; cargo +nightly fuzz --version'
