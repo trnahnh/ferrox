@@ -32,6 +32,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(ring_no_cursor_cache)',
     'cfg(ring_relaxed_ordering)',
     'cfg(ring_unchecked_index)',
+    'cfg(ring_allow_unsound)',
 ] }
 
 [[bench]]

@@ -12,7 +12,8 @@
 //! | `ring_seqcst`            | `SeqCst` on every cursor access (x86-64: `xchg` instead of `mov` for the stores) |
 //! | `ring_no_padding`        | head and tail share one cache line (false sharing experiment)         |
 //! | `ring_no_cursor_cache`   | always reload the remote cursor instead of using the local copy        |
-//! | `ring_relaxed_ordering`  | `Relaxed` cursor accesses. **Unsound.** Only compiles together with `loom`, where it exists to show the model checker catches the resulting data race |
+//! | `ring_relaxed_ordering`  | `Relaxed` cursor accesses. **Unsound.** Only compiles together with `loom` (to show the model checker catches the resulting data race) or `ring_allow_unsound` (to show ThreadSanitizer does) |
+//! | `ring_allow_unsound`     | lets `ring_relaxed_ordering` compile without `loom`, for sanitizer negative controls only; never for a binary anyone runs for real |
 //! | `ring_unchecked_index`   | index the slot array with `get_unchecked` (the index is always `< len` because it is masked, but safe Rust cannot express that); measures the cost of the bounds check |
 //!
 //! ```text
@@ -37,9 +38,9 @@ use loom::sync::Arc;
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicUsize, Ordering};
 
-#[cfg(all(ring_relaxed_ordering, not(loom)))]
+#[cfg(all(ring_relaxed_ordering, not(loom), not(ring_allow_unsound)))]
 compile_error!(
-    "`--cfg ring_relaxed_ordering` makes the ring buffer unsound and is only allowed together with `--cfg loom`"
+    "`--cfg ring_relaxed_ordering` makes the ring buffer unsound and is only allowed together with `--cfg loom` (model checking) or `--cfg ring_allow_unsound` (sanitizer negative controls)"
 );
 
 /// Ordering used for the cursor stores (`head` by the producer, `tail` by the consumer).
@@ -543,24 +544,36 @@ mod tests {
         assert_eq!(received, expected);
     }
 
+    /// Same shape and size as `crate::order::Order` (48 bytes), defined here so
+    /// the ring tests have no dependency outside this module and can be run
+    /// standalone under Miri and ThreadSanitizer (see `verify/ring-standalone`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Payload48 {
+        id: u64,
+        trader_id: u64,
+        price: i64,
+        quantity: u64,
+        timestamp: u64,
+        side: u8,
+    }
+
     #[test]
     fn concurrent_order_struct() {
-        use crate::order::{Order, Side};
+        const _: () = assert!(std::mem::size_of::<Payload48>() == 48);
 
-        let (mut p, mut c) = ring_buffer::<Order>(256);
+        let (mut p, mut c) = ring_buffer::<Payload48>(256);
         let count = 10_000u64;
 
         let producer = thread::spawn(move || {
             for i in 0..count {
-                let order = Order::new(
-                    i,
-                    i % 100,
-                    if i % 2 == 0 { Side::Bid } else { Side::Ask },
-                    10_000 + (i as i64 % 500),
-                    (i % 1000) + 1,
-                    i * 1000,
-                )
-                .unwrap();
+                let order = Payload48 {
+                    id: i,
+                    trader_id: i % 100,
+                    price: 10_000 + (i as i64 % 500),
+                    quantity: (i % 1000) + 1,
+                    timestamp: i * 1000,
+                    side: (i % 2) as u8,
+                };
                 while p.push(order.clone()).is_err() {
                     thread::yield_now();
                 }
@@ -586,7 +599,7 @@ mod tests {
             let i = i as u64;
             assert_eq!(order.id, i);
             assert_eq!(order.trader_id, i % 100);
-            assert_eq!(order.side, if i % 2 == 0 { Side::Bid } else { Side::Ask });
+            assert_eq!(order.side, (i % 2) as u8);
             assert_eq!(order.price, 10_000 + (i as i64 % 500));
             assert_eq!(order.quantity, (i % 1000) + 1);
             assert_eq!(order.timestamp, i * 1000);

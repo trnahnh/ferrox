@@ -40,3 +40,9 @@ cpp/*.o
 cpp/test_ring
 cpp/bench_ring
 cpp/asm_probe
+
+# cargo-fuzz build outputs and crash artifacts (the seed corpus is committed)
+fuzz/target
+fuzz/artifacts
+fuzz/coverage
+verify/ring-standalone/target
