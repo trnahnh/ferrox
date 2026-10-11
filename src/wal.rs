@@ -18,7 +18,7 @@ fn align_up(n: usize) -> usize {
 }
 
 #[derive(Debug)]
-pub(crate) enum WalError {
+pub enum WalError {
     Io(io::Error),
     Protocol(protocol::ProtocolError),
     Corruption { offset: u64 },
@@ -58,7 +58,7 @@ impl From<protocol::ProtocolError> for WalError {
 /// ```text
 /// [payload_len: u32 LE][crc32: u32 LE][payload: N bytes][padding to 8-byte align]
 /// ```
-pub(crate) struct Wal {
+pub struct Wal {
     mmap: MmapMut,
     file: File,
     #[allow(dead_code)]
@@ -72,15 +72,12 @@ pub(crate) struct Wal {
 impl Wal {
     /// Open or create a WAL file. On reopen, scans existing records to restore
     /// `write_pos` and `record_count`.
-    pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
         Self::open_with_size(path, DEFAULT_INITIAL_SIZE)
     }
 
     /// Open with a custom initial mmap size (useful for tests).
-    pub(crate) fn open_with_size(
-        path: impl AsRef<Path>,
-        initial_size: u64,
-    ) -> Result<Self, WalError> {
+    pub fn open_with_size(path: impl AsRef<Path>, initial_size: u64) -> Result<Self, WalError> {
         let path = path.as_ref().to_path_buf();
 
         let file = OpenOptions::new()
@@ -102,23 +99,36 @@ impl Wal {
         // this file. No other process reads/writes it concurrently.
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
-        let mut wal = Self {
+        let scan = scan_records(&mmap);
+
+        // Establish the module invariant: every byte at or beyond `write_pos`
+        // is zero. Whatever follows the last valid record (a torn record, a
+        // corrupt one, or a zeroed header) may still be followed by *older,
+        // valid records* left over from before a previous crash. If they were
+        // left in place, new appends that happen to realign with the old
+        // record boundaries would make them readable again on the next
+        // recovery (found by tests/crash_recovery.rs). Discarding them at the
+        // file level is O(1) and the re-extended region reads as zeros, so no
+        // page up to `mapped_size` has to be dirtied.
+        drop(mmap);
+        file.set_len(scan.end)?;
+        file.set_len(mapped_size)?;
+        // SAFETY: as above; the previous mapping has been dropped.
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
+
+        Ok(Self {
             mmap,
             file,
             path,
-            write_pos: 0,
+            write_pos: scan.end,
             mapped_size,
             encode_buf: [0u8; NEW_ORDER_SIZE],
-            record_count: 0,
-        };
-
-        wal.scan_to_end()?;
-
-        Ok(wal)
+            record_count: scan.count,
+        })
     }
 
     /// Append an `EngineCommand` to the WAL. Returns the record number (1-based).
-    pub(crate) fn append(&mut self, cmd: &EngineCommand) -> Result<u64, WalError> {
+    pub fn append(&mut self, cmd: &EngineCommand) -> Result<u64, WalError> {
         let payload_len = match cmd {
             EngineCommand::NewOrder(order) => {
                 protocol::encode_new_order(&mut self.encode_buf, order)?
@@ -152,18 +162,18 @@ impl Wal {
         Ok(self.record_count)
     }
 
-    pub(crate) fn record_count(&self) -> u64 {
+    pub fn record_count(&self) -> u64 {
         self.record_count
     }
 
-    #[cfg(test)]
-    pub(crate) fn write_pos(&self) -> u64 {
+    /// Byte offset of the next append, i.e. the length of the valid log.
+    pub fn write_pos(&self) -> u64 {
         self.write_pos
     }
 
     /// Iterate all valid records starting from record number `start_record` (1-based).
     /// Pass 0 to iterate from the very beginning.
-    pub(crate) fn iter_from(&self, start_record: u64) -> WalIterator<'_> {
+    pub fn iter_from(&self, start_record: u64) -> WalIterator<'_> {
         WalIterator {
             mmap: &self.mmap,
             read_pos: 0,
@@ -173,7 +183,7 @@ impl Wal {
         }
     }
 
-    pub(crate) fn truncate_to(&mut self, offset: u64, record_count: u64) -> Result<(), WalError> {
+    pub fn truncate_to(&mut self, offset: u64, record_count: u64) -> Result<(), WalError> {
         let start = offset as usize;
         let end = self.write_pos as usize;
         if end > start {
@@ -184,7 +194,7 @@ impl Wal {
         Ok(())
     }
 
-    pub(crate) fn flush_async(&self) -> Result<(), WalError> {
+    pub fn flush_async(&self) -> Result<(), WalError> {
         self.mmap.flush_async().map_err(WalError::Io)
     }
 
@@ -202,50 +212,58 @@ impl Wal {
 
         Ok(())
     }
-
-    fn scan_to_end(&mut self) -> Result<(), WalError> {
-        let mut pos: u64 = 0;
-        let mut count: u64 = 0;
-        let file_len = self.mapped_size;
-
-        loop {
-            if pos + HEADER_SIZE as u64 > file_len {
-                break;
-            }
-
-            let p = pos as usize;
-            let payload_len = u32::from_le_bytes(self.mmap[p..p + 4].try_into().unwrap()) as usize;
-
-            // A zero payload_len means we've hit unwritten space.
-            if payload_len == 0 {
-                break;
-            }
-
-            let record_size = align_up(HEADER_SIZE + payload_len);
-            if pos + record_size as u64 > file_len {
-                // Truncated record — discard it.
-                break;
-            }
-
-            let stored_crc = u32::from_le_bytes(self.mmap[p + 4..p + 8].try_into().unwrap());
-            let computed_crc =
-                crc32fast::hash(&self.mmap[p + HEADER_SIZE..p + HEADER_SIZE + payload_len]);
-
-            if stored_crc != computed_crc {
-                break;
-            }
-
-            pos += record_size as u64;
-            count += 1;
-        }
-
-        self.write_pos = pos;
-        self.record_count = count;
-        Ok(())
-    }
 }
 
-pub(crate) struct WalIterator<'a> {
+/// Result of walking the records at the start of a mapped log.
+struct Scan {
+    /// Byte offset just past the last valid record.
+    end: u64,
+    /// Number of valid records.
+    count: u64,
+}
+
+/// Walks records from offset 0 until the first zero header, torn record,
+/// CRC mismatch, or end of data. Nothing at or after `end` is trusted.
+fn scan_records(data: &[u8]) -> Scan {
+    let file_len = data.len() as u64;
+    let mut pos: u64 = 0;
+    let mut count: u64 = 0;
+
+    loop {
+        if pos + HEADER_SIZE as u64 > file_len {
+            break;
+        }
+
+        let p = pos as usize;
+        let payload_len = u32::from_le_bytes(data[p..p + 4].try_into().unwrap()) as usize;
+
+        // A zero payload_len means unwritten space (or a header whose first
+        // byte was lost; either way nothing after it can be trusted).
+        if payload_len == 0 {
+            break;
+        }
+
+        let record_size = align_up(HEADER_SIZE + payload_len);
+        if pos + record_size as u64 > file_len {
+            // Truncated record — discard it.
+            break;
+        }
+
+        let stored_crc = u32::from_le_bytes(data[p + 4..p + 8].try_into().unwrap());
+        let computed_crc = crc32fast::hash(&data[p + HEADER_SIZE..p + HEADER_SIZE + payload_len]);
+
+        if stored_crc != computed_crc {
+            break;
+        }
+
+        pos += record_size as u64;
+        count += 1;
+    }
+
+    Scan { end: pos, count }
+}
+
+pub struct WalIterator<'a> {
     mmap: &'a [u8],
     read_pos: u64,
     end_pos: u64,

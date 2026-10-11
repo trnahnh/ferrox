@@ -1,0 +1,28 @@
+# Zero-dependency view of the SPSC ring, so Miri and ThreadSanitizer can run on
+# `src/ring.rs` without compiling the main crate's dependencies (criterion,
+# proptest, serde, ...). The module is included by path; nothing is copied.
+#
+#   cd verify/ring-standalone
+#   cargo +nightly miri test -- --skip concurrent_
+#   RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu -- --test-threads=1
+[package]
+name = "ferrox-ring-standalone"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(loom)',
+    'cfg(ring_seqcst)',
+    'cfg(ring_no_padding)',
+    'cfg(ring_no_cursor_cache)',
+    'cfg(ring_relaxed_ordering)',
+    'cfg(ring_unchecked_index)',
+    'cfg(ring_allow_unsound)',
+] }

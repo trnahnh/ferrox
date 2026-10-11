@@ -1,0 +1,38 @@
+[package]
+name = "ferrox-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+
+[dependencies.ferrox]
+path = ".."
+
+[[bin]]
+name = "protocol_decode"
+path = "fuzz_targets/protocol_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_recover"
+path = "fuzz_targets/wal_recover.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_load"
+path = "fuzz_targets/snapshot_load.rs"
+test = false
+doc = false
+bench = false

@@ -32,3 +32,17 @@ infra/*.tfstate
 infra/*.tfstate.*
 infra/terraform.tfvars
 infra/*.tfplan
+
+# C++ ring buffer build outputs (see cpp/)
+cpp/*.exe
+cpp/*.s
+cpp/*.o
+cpp/test_ring
+cpp/bench_ring
+cpp/asm_probe
+
+# cargo-fuzz build outputs and crash artifacts (the seed corpus is committed)
+fuzz/target
+fuzz/artifacts
+fuzz/coverage
+verify/ring-standalone/target

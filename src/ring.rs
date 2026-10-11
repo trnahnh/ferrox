@@ -1,11 +1,69 @@
-use std::cell::UnsafeCell;
+//! Lock-free single-producer single-consumer ring buffer (Disruptor pattern).
+//!
+//! # Verification and experiment knobs
+//!
+//! All knobs are `--cfg` flags passed through `RUSTFLAGS`; none is set in a
+//! default build, so the shipped code path is exactly the plain
+//! acquire/release, cache-padded, cursor-caching ring.
+//!
+//! | cfg                      | effect                                                                 |
+//! |--------------------------|------------------------------------------------------------------------|
+//! | `loom`                   | use loom's instrumented atomics/`UnsafeCell`/`Arc` so `tests/loom_ring.rs` can model-check every interleaving under the C11 memory model |
+//! | `ring_seqcst`            | `SeqCst` on every cursor access (x86-64: `xchg` instead of `mov` for the stores) |
+//! | `ring_no_padding`        | head and tail share one cache line (false sharing experiment)         |
+//! | `ring_no_cursor_cache`   | always reload the remote cursor instead of using the local copy        |
+//! | `ring_relaxed_ordering`  | `Relaxed` cursor accesses. **Unsound.** Only compiles together with `loom` (to show the model checker catches the resulting data race) or `ring_allow_unsound` (to show ThreadSanitizer does) |
+//! | `ring_allow_unsound`     | lets `ring_relaxed_ordering` compile without `loom`, for sanitizer negative controls only; never for a binary anyone runs for real |
+//! | `ring_unchecked_index`   | index the slot array with `get_unchecked` (the index is always `< len` because it is masked, but safe Rust cannot express that); measures the cost of the bounds check |
+//!
+//! ```text
+//! RUSTFLAGS="--cfg loom" cargo test --release --test loom_ring
+//! RUSTFLAGS="--cfg ring_no_padding" cargo run --release --example ring_throughput
+//! ```
 use std::fmt;
-use std::mem::MaybeUninit;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ops::{Deref, DerefMut};
+
+#[cfg(not(loom))]
+use std::cell::UnsafeCell;
+#[cfg(not(loom))]
 use std::sync::Arc;
+#[cfg(not(loom))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[repr(align(64))]
+#[cfg(loom)]
+use loom::cell::UnsafeCell;
+#[cfg(loom)]
+use loom::sync::Arc;
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(all(ring_relaxed_ordering, not(loom), not(ring_allow_unsound)))]
+compile_error!(
+    "`--cfg ring_relaxed_ordering` makes the ring buffer unsound and is only allowed together with `--cfg loom` (model checking) or `--cfg ring_allow_unsound` (sanitizer negative controls)"
+);
+
+/// Ordering used for the cursor stores (`head` by the producer, `tail` by the consumer).
+const STORE_ORDER: Ordering = if cfg!(ring_relaxed_ordering) {
+    Ordering::Relaxed
+} else if cfg!(ring_seqcst) {
+    Ordering::SeqCst
+} else {
+    Ordering::Release
+};
+
+/// Ordering used for the cursor loads that observe the other side's progress.
+const LOAD_ORDER: Ordering = if cfg!(ring_relaxed_ordering) {
+    Ordering::Relaxed
+} else if cfg!(ring_seqcst) {
+    Ordering::SeqCst
+} else {
+    Ordering::Acquire
+};
+
+/// Pads `T` to its own 64-byte cache line so two frequently written values do
+/// not ping-pong a shared line between cores (false sharing).
+#[cfg_attr(not(ring_no_padding), repr(align(64)))]
 pub struct CachePadded<T> {
     value: T,
 }
@@ -40,12 +98,96 @@ impl<T> fmt::Debug for Full<T> {
 #[derive(Debug)]
 pub struct Empty;
 
+/// One buffer slot. Wraps the interior-mutable storage so the std and loom
+/// code paths differ only here; the ring logic above it is identical.
+struct Slot<T>(UnsafeCell<MaybeUninit<T>>);
+
+impl<T> Slot<T> {
+    fn uninit() -> Self {
+        Self(UnsafeCell::new(MaybeUninit::uninit()))
+    }
+}
+
+#[cfg(not(loom))]
+impl<T> Slot<T> {
+    /// # Safety
+    /// The caller must be the only party accessing this slot (the producer, for
+    /// a slot the consumer has released) and the slot must not hold a live value.
+    #[inline]
+    unsafe fn write(&self, value: T) {
+        // SAFETY: exclusive access is guaranteed by the SPSC protocol (see
+        // `Producer::push`), so no other reference to this slot exists.
+        unsafe { (*self.0.get()).write(value) };
+    }
+
+    /// # Safety
+    /// The slot must hold an initialized value that the caller now exclusively owns.
+    #[inline]
+    unsafe fn read(&self) -> T {
+        // SAFETY: exclusive access is guaranteed by the SPSC protocol (see
+        // `Consumer::pop`); the value was initialized by `write`.
+        unsafe { (*self.0.get()).assume_init_read() }
+    }
+
+    /// # Safety
+    /// The slot must hold an initialized value. Only used from `Drop` with `&mut`.
+    unsafe fn drop_in_place(&mut self) {
+        // SAFETY: `&mut self` proves exclusivity; the caller guarantees the
+        // slot is initialized.
+        unsafe { (*self.0.get()).assume_init_drop() };
+    }
+}
+
+#[cfg(loom)]
+impl<T> Slot<T> {
+    /// # Safety
+    /// Same contract as the non-loom version; loom additionally verifies that
+    /// this access is ordered before/after every other access to the slot.
+    #[inline]
+    unsafe fn write(&self, value: T) {
+        self.0.with_mut(|ptr| unsafe { (*ptr).write(value) });
+    }
+
+    /// # Safety
+    /// Same contract as the non-loom version.
+    #[inline]
+    unsafe fn read(&self) -> T {
+        self.0.with(|ptr| unsafe { (*ptr).assume_init_read() })
+    }
+
+    /// # Safety
+    /// Same contract as the non-loom version.
+    unsafe fn drop_in_place(&mut self) {
+        self.0.with_mut(|ptr| unsafe { (*ptr).assume_init_drop() });
+    }
+}
+
 struct RingBufferInner<T> {
-    buffer: Box<[UnsafeCell<MaybeUninit<T>>]>,
+    buffer: Box<[Slot<T>]>,
     capacity: usize,
     mask: usize,
     head: CachePadded<AtomicUsize>,
     tail: CachePadded<AtomicUsize>,
+}
+
+impl<T> RingBufferInner<T> {
+    /// The slot for a free-running cursor value.
+    #[inline]
+    fn slot(&self, cursor: usize) -> &Slot<T> {
+        let index = cursor & self.mask;
+
+        #[cfg(not(ring_unchecked_index))]
+        {
+            &self.buffer[index]
+        }
+
+        #[cfg(ring_unchecked_index)]
+        // SAFETY: `mask == buffer.len() - 1` and `buffer.len()` is a power of
+        // two, so `cursor & mask < buffer.len()` for every cursor value.
+        unsafe {
+            self.buffer.get_unchecked(index)
+        }
+    }
 }
 
 // SAFETY: The SPSC protocol guarantees that only the Producer writes to slots
@@ -66,17 +208,50 @@ impl<T> Drop for RingBufferInner<T> {
         // and need dropping.
         let mut i = tail;
         while i != head {
-            unsafe {
-                let slot = &mut *self.buffer[i & self.mask].get();
-                slot.assume_init_drop();
-            }
+            unsafe { self.buffer[i & self.mask].drop_in_place() };
             i = i.wrapping_add(1);
         }
     }
 }
 
+/// Shared ownership of the ring, dropped by value.
+///
+/// `Arc`'s own `Drop` hands `&mut self` to the out-of-line `Arc::drop_slow`.
+/// When a `Producer`/`Consumer` is a local variable, that call (which exists
+/// even if it only sits on the panic-cleanup path of the caller's loop) makes
+/// the address of the whole struct escape, so LLVM cannot promote
+/// `cached_head`/`cached_tail` to registers and every push/pop round-trips the
+/// cursors through the stack. Taking the `Arc` out by value in our own `Drop`
+/// means only a temporary's address is ever passed, and the hot-loop locals
+/// stay in registers. See docs/MEMORY_ORDERING.md §5 for the measurements.
+struct Shared<T>(ManuallyDrop<Arc<RingBufferInner<T>>>);
+
+impl<T> Shared<T> {
+    #[inline]
+    fn new(inner: Arc<RingBufferInner<T>>) -> Self {
+        Self(ManuallyDrop::new(inner))
+    }
+}
+
+impl<T> Deref for Shared<T> {
+    type Target = RingBufferInner<T>;
+    #[inline]
+    fn deref(&self) -> &RingBufferInner<T> {
+        &self.0
+    }
+}
+
+impl<T> Drop for Shared<T> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: `Drop::drop` runs exactly once and nothing reads `self.0`
+        // afterwards, so the `Arc` is moved out exactly once.
+        drop(unsafe { ManuallyDrop::take(&mut self.0) });
+    }
+}
+
 pub struct Producer<T> {
-    inner: Arc<RingBufferInner<T>>,
+    inner: Shared<T>,
     cached_head: usize,
     cached_tail: usize,
 }
@@ -89,24 +264,23 @@ impl<T> Producer<T> {
     pub fn push(&mut self, value: T) -> Result<(), Full<T>> {
         let head = self.cached_head;
 
-        if head.wrapping_sub(self.cached_tail) == self.inner.capacity {
-            self.cached_tail = self.inner.tail.load(Ordering::Acquire);
+        if cfg!(ring_no_cursor_cache) || head.wrapping_sub(self.cached_tail) == self.inner.capacity
+        {
+            self.cached_tail = self.inner.tail.load(LOAD_ORDER);
             if head.wrapping_sub(self.cached_tail) == self.inner.capacity {
                 return Err(Full(value));
             }
         }
 
+        let slot = self.inner.slot(head);
+
         // SAFETY: Producer has exclusive write access to buffer[head & mask].
         // The slot has been released by the consumer (tail has advanced past it)
         // or was never written (initial state). The Acquire load of `tail`
         // above ensures the consumer's read of the previous value is complete.
-        unsafe {
-            (*self.inner.buffer[head & self.inner.mask].get()).write(value);
-        }
+        unsafe { slot.write(value) };
 
-        self.inner
-            .head
-            .store(head.wrapping_add(1), Ordering::Release);
+        self.inner.head.store(head.wrapping_add(1), STORE_ORDER);
         self.cached_head = head.wrapping_add(1);
 
         Ok(())
@@ -118,7 +292,7 @@ impl<T> Producer<T> {
 }
 
 pub struct Consumer<T> {
-    inner: Arc<RingBufferInner<T>>,
+    inner: Shared<T>,
     cached_tail: usize,
     cached_head: usize,
 }
@@ -131,23 +305,22 @@ impl<T> Consumer<T> {
     pub fn pop(&mut self) -> Result<T, Empty> {
         let tail = self.cached_tail;
 
-        if tail == self.cached_head {
-            self.cached_head = self.inner.head.load(Ordering::Acquire);
+        if cfg!(ring_no_cursor_cache) || tail == self.cached_head {
+            self.cached_head = self.inner.head.load(LOAD_ORDER);
             if tail == self.cached_head {
                 return Err(Empty);
             }
         }
 
+        let slot = self.inner.slot(tail);
+
         // SAFETY: Consumer has exclusive read access to buffer[tail & mask].
         // The slot was written by the producer (head has advanced past it).
         // The Acquire load of `head` above ensures the producer's write is
         // visible.
-        let value =
-            unsafe { (*self.inner.buffer[tail & self.inner.mask].get()).assume_init_read() };
+        let value = unsafe { slot.read() };
 
-        self.inner
-            .tail
-            .store(tail.wrapping_add(1), Ordering::Release);
+        self.inner.tail.store(tail.wrapping_add(1), STORE_ORDER);
         self.cached_tail = tail.wrapping_add(1);
 
         Ok(value)
@@ -170,7 +343,7 @@ pub fn ring_buffer<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
 
     let mut buffer = Vec::with_capacity(capacity);
     for _ in 0..capacity {
-        buffer.push(UnsafeCell::new(MaybeUninit::uninit()));
+        buffer.push(Slot::uninit());
     }
 
     let inner = Arc::new(RingBufferInner {
@@ -182,13 +355,13 @@ pub fn ring_buffer<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
     });
 
     let producer = Producer {
-        inner: Arc::clone(&inner),
+        inner: Shared::new(Arc::clone(&inner)),
         cached_head: 0,
         cached_tail: 0,
     };
 
     let consumer = Consumer {
-        inner,
+        inner: Shared::new(inner),
         cached_tail: 0,
         cached_head: 0,
     };
@@ -196,7 +369,7 @@ pub fn ring_buffer<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
     (producer, consumer)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize as StdAtomicUsize;
@@ -371,24 +544,36 @@ mod tests {
         assert_eq!(received, expected);
     }
 
+    /// Same shape and size as `crate::order::Order` (48 bytes), defined here so
+    /// the ring tests have no dependency outside this module and can be run
+    /// standalone under Miri and ThreadSanitizer (see `verify/ring-standalone`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Payload48 {
+        id: u64,
+        trader_id: u64,
+        price: i64,
+        quantity: u64,
+        timestamp: u64,
+        side: u8,
+    }
+
     #[test]
     fn concurrent_order_struct() {
-        use crate::order::{Order, Side};
+        const _: () = assert!(std::mem::size_of::<Payload48>() == 48);
 
-        let (mut p, mut c) = ring_buffer::<Order>(256);
+        let (mut p, mut c) = ring_buffer::<Payload48>(256);
         let count = 10_000u64;
 
         let producer = thread::spawn(move || {
             for i in 0..count {
-                let order = Order::new(
-                    i,
-                    i % 100,
-                    if i % 2 == 0 { Side::Bid } else { Side::Ask },
-                    10_000 + (i as i64 % 500),
-                    (i % 1000) + 1,
-                    i * 1000,
-                )
-                .unwrap();
+                let order = Payload48 {
+                    id: i,
+                    trader_id: i % 100,
+                    price: 10_000 + (i as i64 % 500),
+                    quantity: (i % 1000) + 1,
+                    timestamp: i * 1000,
+                    side: (i % 2) as u8,
+                };
                 while p.push(order.clone()).is_err() {
                     thread::yield_now();
                 }
@@ -414,7 +599,7 @@ mod tests {
             let i = i as u64;
             assert_eq!(order.id, i);
             assert_eq!(order.trader_id, i % 100);
-            assert_eq!(order.side, if i % 2 == 0 { Side::Bid } else { Side::Ask });
+            assert_eq!(order.side, (i % 2) as u8);
             assert_eq!(order.price, 10_000 + (i as i64 % 500));
             assert_eq!(order.quantity, (i % 1000) + 1);
             assert_eq!(order.timestamp, i * 1000);

@@ -1,6 +1,6 @@
 # Ferrox
 
-A low-latency order matching engine in Rust. **500ns P99 latency, 4.7M orders/sec**, zero heap allocation on the hot path.
+A low-latency order matching engine in Rust. **Sub-microsecond per-order latency (P99 0.83–1.06 µs, TSC-timed), 4.36–4.41M orders/sec**, zero heap allocation on the hot path for orders and fills. Every number in this README comes from a command you can rerun; the ring buffer is model-checked under the C11 memory model and ported to C++ for a like-for-like comparison.
 
 ## The Problem
 
@@ -45,13 +45,13 @@ Replaced `HashMap` with `BTreeMap` for price levels. Best-price recomputation af
 
 Built a Disruptor-style SPSC ring buffer for the ingestion-to-matching pipeline. Free-running `AtomicUsize` cursors with bitmask indexing, `CachePadded` atomics to prevent false sharing, and local cursor caching to minimize cross-core cache bouncing. Acquire/Release ordering compiles to plain MOV instructions on x86 — zero barrier overhead.
 
-| Benchmark | SPSC Ring | std::sync::mpsc | Speedup |
-| --- | --- | --- | --- |
-| u64 throughput (1M) | 1.85 ms | 16.35 ms | **8.8x** |
-| Order throughput (1M) | 5.51 ms | 20.03 ms | **3.6x** |
-| Push+pop latency | 2.11 ns | — | — |
+| Benchmark (2026-10-10 run) | SPSC Ring | std::sync::mpsc (blocking recv) | std::sync::mpsc (try_recv spin) | Speedup vs best mpsc |
+| --- | --- | --- | --- | --- |
+| u64 throughput (1M) | 3.06 ms | 11.80 ms | 9.73 ms | **3.2x** |
+| Order (48B) throughput (1M) | 12.79 ms | 14.92 ms | 27.36 ms | **1.17x** |
+| Push+pop latency (1 thread) | 2.37 ns | — | — | — |
 
-540M ops/sec for raw values. 182M ops/sec for 48-byte Order structs.
+327M ops/sec for raw values, 78M ops/sec for 48-byte Order structs, on an AMD Ryzen 7 7735HS laptop. An earlier session recorded 1.85 ms vs 16.35 ms (8.8x) and 5.51 ms vs 20.03 ms (3.6x); those gaps have not been reproduced since. This benchmark includes thread creation and runs unpinned, and the same binary varies 1.5x between sessions, so treat the ratio as "several times faster for small payloads, roughly even for 48-byte payloads". The "plain MOV" claim above is verified from the generated assembly in [docs/MEMORY_ORDERING.md](docs/MEMORY_ORDERING.md).
 
 ### Phase 5 — Binary Protocol + Networking
 
@@ -75,14 +75,39 @@ WAL uses the existing `protocol.rs` codec — no duplicate serialization. Pre-al
 
 Eliminated the last hot-path allocation: `AddOrderResult.fills` changed from `Vec<Fill>` to `&[Fill]` borrowed from the engine's pre-allocated buffer. Added HdrHistogram latency recording, a tracking allocator, end-to-end criterion benchmarks, and a load generator.
 
-| Percentile | Latency |
-| --- | --- |
-| P50 | 100 ns |
-| P90 | 200 ns |
-| P99 | 500 ns |
-| P99.9 | 800 ns |
+| Percentile (2026-10-10, TSC clock) | Run 1 | Run 2 | Run 3 |
+| --- | --- | --- | --- |
+| P50 | 130 ns | 210 ns | 190 ns |
+| P90 | 321 ns | 481 ns | 431 ns |
+| P99 | 832 ns | 1062 ns | 982 ns |
+| P99.9 | 1404 ns | 1584 ns | 1684 ns |
+| Mean | 171 ns | 257 ns | 250 ns |
 
-4.7M orders/sec sustained throughput. Ring pop → match → encode execution report — the full hot path measured per order.
+Ring pop → match → encode execution report, measured per order over 990,000 orders (about 63% fill, 37% rest in the book). Throughput is 3.21–4.01M orders/sec with two clock reads per order for the histogram and 4.36–4.41M orders/sec without timing.
+
+The earlier published figures (P50/P90/P99 = 100/200/500 ns, 4.7M/s) were taken with `std::time::Instant`, which on Windows advances in 100 ns steps, so each percentile was quantized to that grid. The load generator now uses the x86-64 timestamp counter (0.3 ns step) and prints the clock step it observed; `--instant` reproduces the old method. Details in [docs/VERIFICATION.md §5](docs/VERIFICATION.md#6-measurement-checks-that-came-out-of-the-audit).
+
+### Phase 8 — Verify It (Memory Model, Differential Tests, C++ Port)
+
+Benchmarks say the ring is fast; this phase asks whether it is *right*, and what each design decision is worth.
+
+- **Model checking.** The ring compiles against [loom](https://docs.rs/loom) (`--cfg loom`), which explores every interleaving the C11 memory model allows and checks every slot access for a data race. FIFO across wraparound and backpressure, and exactly-once drop, pass. Downgrading the cursors to `Relaxed` (`--cfg ring_relaxed_ordering`) is caught immediately: `Causality violation: Concurrent read and write accesses.`
+- **Differential testing.** Random add/cancel sequences run through the engine and a naive flat-`Vec` reference book; status, fills, cancels, best prices and full book contents must agree after every operation, and replaying the same input must produce the same transcript. No disagreement in 512 cases per property.
+- **C++ port.** `cpp/spsc_ring.hpp` is a line-for-line C++20 port with the same compile-time knobs. Cross-thread throughput is a tie within noise (medians favor Rust by 10–20%, minimums favor C++ by 5–10%); single-threaded push+pop is 1.5–3.5x faster in C++, partly the bounds check safe Rust cannot elide (10–25% of the loop), the rest unexplained.
+- **What the design decisions cost**, same session, one knob at a time: SeqCst instead of acquire/release is 5.4x (Rust) / 6.0x (C++) slower on u64 transfer; putting both cursors on one cache line is 2x slower; dropping the cached remote cursor is 1.4–1.7x slower. Both compilers emit plain `mov` for the release stores and `xchg` under SeqCst.
+
+Full numbers and reproduction: [docs/MEMORY_ORDERING.md](docs/MEMORY_ORDERING.md), [docs/VERIFICATION.md](docs/VERIFICATION.md).
+
+### Phase 9 — Break It (Crash Consistency, Statistics, Sanitizers)
+
+Round two of verification: the checks that were written but never run, the numbers that were too noisy to settle, and the one performance gap nobody had explained.
+
+- **Crash consistency, exhaustively.** `tests/crash_recovery.rs` truncates and corrupts the WAL at every byte offset (3 corruption patterns), does the same to a snapshot file, and kills a writer process mid-write over repeated cycles, checking after each fault that recovery never panics, yields exactly the longest valid prefix, and produces the same book as a fresh replay. It found two real defects: discarded records could **resurrect** after a corrupt record once new appends realigned with the old boundaries, and the snapshot checksum **did not cover its own WAL position**, so a corrupted position was accepted and replay started from the wrong record. Both fixed; 3,362 injected faults and 12 kills now pass.
+- **The single-thread Rust-vs-C++ gap, explained.** It was not the `Result` return convention. LLVM kept every producer/consumer field on the stack because `Arc`'s drop hands `&mut self` to an out-of-line function, which pins the whole struct in memory and blocks register promotion for the cursors; g++ keeps the same fields in registers. Holding the `Arc` in a `ManuallyDrop` and dropping it by value fixes it with zero change to the push/pop code. Single-thread push+pop: 2.752 → 1.610 ns (p = 1.4e-14, n = 40); the remaining 1.35x to C++ is mostly the bounds check safe Rust cannot elide.
+- **Statistics instead of two runs.** `scripts/bench_compare.py` interleaves variants round by round on pinned cores and reports bootstrap CIs, Mann-Whitney p-values and Cliff's delta. Verdicts that hold across runs: cross-thread 48-byte transfer is **10–17% faster in Rust** (p ≤ 0.003); cross-thread 8-byte transfer is a tie; single-thread push+pop is 1.35–1.7x faster in C++.
+- **Sanitizers, actually run** (WSL2 Ubuntu): ThreadSanitizer and ASan+UBSan on the C++ ring pass; the `Relaxed` build is caught by TSan (exit 66). Rust Miri/TSan, loom on Linux, 10-minute fuzzing of the wire protocol, WAL and snapshot loaders, and `perf stat` hardware counters: see [docs/VERIFICATION.md](docs/VERIFICATION.md) and [ROUND2_REPORT.md](ROUND2_REPORT.md) for what completed and what the memory-starved VM did not allow.
+
+How every benchmark is run and how much noise to expect: [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
 
 ### Cloud Deployment — The Decoupled Subscriber
 
@@ -103,23 +128,45 @@ Measured, not estimated: **~$0.041/hr** to run (70% of that is the NLB, not the 
 | 5 | Binary protocol, TCP/UDP networking, 2-thread pipeline | Done |
 | 6 | WAL persistence, snapshots, deterministic crash recovery | Done |
 | 7 | End-to-end benchmarking suite, HdrHistogram, observability | Done |
+| 8 | loom model checking, differential property tests, C++ port, memory-ordering and cache analysis | Done |
+| 9 | crash-consistency fault injection, pinned statistics, single-thread gap root-caused, sanitizers run on Linux, fuzzing | Done (see ROUND2_REPORT.md for what remains unverified) |
 
-137 tests (with `--features metrics`). ~0.25s test time. 6 `unsafe` blocks total (4 in ring buffer, 2 in WAL mmap), each with documented safety invariants.
+148 tests with `--features metrics` (139 unit + 4 differential + 5 crash-consistency), plus 4 loom model checks under `--cfg loom`, 6 C++ tests and 3 fuzz targets. `unsafe` inventory: 7 blocks + 3 `unsafe impl` in the ring buffer (3 primitive slot operations, their 3 call sites, and the `ManuallyDrop::take` in `Shared::drop`), 2 blocks in the WAL mmap, 2 blocks + 1 `unsafe impl` in the tracking allocator; every one has a documented invariant. See [docs/VERIFICATION.md §3](docs/VERIFICATION.md#3-unsafe-inventory).
 
 ## Quick Start
 
 ```bash
 cargo build --release     # build
-cargo test                # 134 tests
+cargo test                # 138 tests (141 with --features metrics)
 cargo bench               # criterion benchmarks (matching, ring buffer, WAL, snapshots, e2e)
-cargo run --release --example loadgen --features metrics  # latency histogram
+cargo run --release --example loadgen --features metrics  # per-order latency histogram (TSC clock)
+cargo run --release --example loadgen                     # throughput only
+
+RUSTFLAGS="--cfg loom" cargo test --release --test loom_ring       # model-check the ring
+cargo test --release --test crash_recovery -- --nocapture            # fault injection: every byte offset, process kills
+cargo run --release --example ring_throughput -- 30 --pin 2,4        # Rust ring harness, pinned to two physical cores
+g++ -std=c++20 -O3 -pthread cpp/bench_ring.cpp -o cpp/bench_ring && cpp/bench_ring 30 --pin 2,4   # C++ port, same harness
+python3 scripts/bench_compare.py --pin 2,4 rust=target/release/examples/ring_throughput cpp=cpp/bench_ring  # interleaved A/B with CIs
+bash scripts/asm_ordering.sh                                         # acquire/release vs SeqCst assembly
+bash scripts/asm_loop.sh                                             # the single-thread loop, Rust vs C++
+
+# Linux only
+(cd verify/ring-standalone && cargo +nightly miri test -- --skip concurrent_)                       # Miri on the ring
+(cd verify/ring-standalone && RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu)
+clang++ -std=c++20 -O1 -g -fsanitize=thread -pthread cpp/test_ring.cpp -o test_tsan && ./test_tsan  # C++ TSan
+cargo +nightly fuzz run protocol_decode -- -max_total_time=600       # fuzz the wire protocol decoder
+bash scripts/perf_counters.sh 2,4                                    # perf stat on the ring variants
 ```
 
 ## Documentation
 
 - [System Design](docs/SYSTEM_DESIGN.md) — architecture, failure analysis, hardware considerations, deployment strategy
 - [Development Phases](docs/PHASES.md) — deliverables, stack choices, and rationale per phase
-- [Performance Metrics](docs/METRICS.md) — before/after benchmark numbers for every optimization
+- [Performance Metrics](docs/METRICS.md) — before/after benchmark numbers for every optimization, and the 2026-10-10 re-measurement
+- [Verification](docs/VERIFICATION.md) — loom model checking, differential tests, `unsafe` inventory, sanitizer CI, measurement corrections
+- [Memory Ordering and Cache Analysis](docs/MEMORY_ORDERING.md) — generated assembly, cost of SeqCst / false sharing / cursor caching / bounds checks, Rust vs C++, the single-thread gap root-caused
+- [Benchmark Methodology](docs/METHODOLOGY.md) — how every number is produced, clocks, pinning, statistics, noise budget
+- [Round 2 Report](ROUND2_REPORT.md) — audit delta, ranked options, results with before/after, what remains unverified
 - [Cloud Deployment](docs/CLOUD_DEPLOYMENT.md) — the decoupled subscriber on Fargate: measured cost, cold start, and what didn't work cleanly
 
 ## Contact

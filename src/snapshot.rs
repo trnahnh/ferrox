@@ -8,7 +8,7 @@ use crate::matching::MatchingEngine;
 use crate::order::Order;
 
 #[derive(Debug)]
-pub(crate) enum SnapshotError {
+pub enum SnapshotError {
     Io(io::Error),
     Serialize(String),
     Deserialize(String),
@@ -40,21 +40,25 @@ impl From<io::Error> for SnapshotError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Snapshot {
-    pub(crate) wal_record_count: u64,
+pub struct Snapshot {
+    pub wal_record_count: u64,
     pub(crate) orders: Vec<Order>,
     pub(crate) best_bid: Option<i64>,
     pub(crate) best_ask: Option<i64>,
-    /// CRC32 of bincode-serialized `orders`.
+    /// CRC32 over the bincode serialization of every other field
+    /// (`wal_record_count`, `best_bid`, `best_ask`, `orders`). Until
+    /// 2026-10-11 only `orders` was covered, so a corrupted
+    /// `wal_record_count` was accepted and replay started from the wrong
+    /// record (found by tests/crash_recovery.rs).
     pub(crate) checksum: u32,
 }
 
 impl Snapshot {
-    pub(crate) fn capture(engine: &MatchingEngine, wal_record_count: u64) -> Self {
+    pub fn capture(engine: &MatchingEngine, wal_record_count: u64) -> Self {
         let orders = engine.book().all_resting_orders();
         let best_bid = engine.book().best_bid();
         let best_ask = engine.book().best_ask();
-        let checksum = Self::compute_checksum(&orders);
+        let checksum = Self::compute_checksum(wal_record_count, best_bid, best_ask, &orders);
 
         Self {
             wal_record_count,
@@ -66,7 +70,7 @@ impl Snapshot {
     }
 
     /// Atomic save: write to temp file, then rename.
-    pub(crate) fn save(&self, dir: &Path) -> Result<PathBuf, SnapshotError> {
+    pub fn save(&self, dir: &Path) -> Result<PathBuf, SnapshotError> {
         fs::create_dir_all(dir)?;
 
         let filename = format!("snapshot_{:010}.bin", self.wal_record_count);
@@ -82,7 +86,7 @@ impl Snapshot {
     }
 
     /// Returns `Ok(None)` if the directory is empty or doesn't exist.
-    pub(crate) fn load_latest(dir: &Path) -> Result<Option<Self>, SnapshotError> {
+    pub fn load_latest(dir: &Path) -> Result<Option<Self>, SnapshotError> {
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -119,13 +123,18 @@ impl Snapshot {
         Ok(None)
     }
 
-    pub(crate) fn restore(&self, arena_capacity: u32) -> Result<MatchingEngine, SnapshotError> {
+    pub fn restore(&self, arena_capacity: u32) -> Result<MatchingEngine, SnapshotError> {
         MatchingEngine::restore_from_orders(&self.orders, arena_capacity)
             .map_err(|e| SnapshotError::Restore(format!("{e:?}")))
     }
 
-    pub(crate) fn verify_checksum(&self) -> Result<(), SnapshotError> {
-        let actual = Self::compute_checksum(&self.orders);
+    pub fn verify_checksum(&self) -> Result<(), SnapshotError> {
+        let actual = Self::compute_checksum(
+            self.wal_record_count,
+            self.best_bid,
+            self.best_ask,
+            &self.orders,
+        );
         if self.checksum == actual {
             Ok(())
         } else {
@@ -136,9 +145,14 @@ impl Snapshot {
         }
     }
 
-    fn compute_checksum(orders: &[Order]) -> u32 {
-        let bytes =
-            bincode::serialize(orders).expect("serializing orders for checksum should not fail");
+    fn compute_checksum(
+        wal_record_count: u64,
+        best_bid: Option<i64>,
+        best_ask: Option<i64>,
+        orders: &[Order],
+    ) -> u32 {
+        let bytes = bincode::serialize(&(wal_record_count, best_bid, best_ask, orders))
+            .expect("serializing snapshot fields for checksum should not fail");
         crc32fast::hash(&bytes)
     }
 
@@ -226,6 +240,18 @@ mod tests {
         snap.verify_checksum().unwrap();
 
         snap.orders[0].quantity = 999;
+        assert!(snap.verify_checksum().is_err());
+    }
+
+    #[test]
+    fn checksum_covers_wal_record_count() {
+        let engine = engine_with_orders(&[bid(1, 100, 10)]);
+        let mut snap = Snapshot::capture(&engine, 7);
+        snap.verify_checksum().unwrap();
+
+        // A wrong record count makes recovery replay from the wrong place,
+        // so it must be rejected like any other corruption.
+        snap.wal_record_count = 6;
         assert!(snap.verify_checksum().is_err());
     }
 

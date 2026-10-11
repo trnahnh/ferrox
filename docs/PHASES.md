@@ -177,4 +177,66 @@
 
 **Results**: P99 = 500 ns, throughput = 4.7M orders/sec. Fills allocation eliminated (`&[Fill]` borrow instead of `Vec<Fill>`). BTreeMap node allocation is the only remaining heap operation (level creation/removal).
 
+**Re-measured 2026-10-10** (see [METRICS.md](METRICS.md#re-measurement-2026-10-10)): the 500 ns P99 was quantized by a 100 ns-resolution clock; with a TSC clock P99 is 832–1062 ns across three runs, throughput 4.36–4.41M orders/sec without timing. Heap operations on the hot path: 5 allocations / 1,936 bytes per 990,000 orders, all BTreeMap level nodes.
+
 **Status**: Complete.
+
+---
+
+## Phase 8: Verification, Memory-Model Analysis, C++ Port
+
+**Objective**: Establish that the lock-free ring is correct under the C11 memory model (not just fast on one machine), that the matching engine agrees with a naive specification on arbitrary inputs, and what each low-level design decision is actually worth, with a C++ implementation of the same algorithm as the control.
+
+**Deliverables**:
+
+- `src/ring.rs` compiles against loom (`--cfg loom`); `tests/loom_ring.rs` model-checks FIFO delivery across wraparound and backpressure and exactly-once drop. Negative control: `--cfg ring_relaxed_ordering` is detected as a data race.
+- Compile-time experiment knobs (`ring_seqcst`, `ring_no_padding`, `ring_no_cursor_cache`, `ring_unchecked_index`), none active by default, with the same knobs as `-D` macros in the C++ port.
+- `cpp/spsc_ring.hpp` + `cpp/test_ring.cpp` + `cpp/bench_ring.cpp`: C++20 port and harness; `examples/ring_throughput.rs` is the Rust side of the same methodology.
+- `tests/book_model.rs`: differential test of the engine against a flat-`Vec` reference book, plus a determinism property. `tests/ring_model.rs`: ring vs bounded `VecDeque`.
+- `scripts/asm_ordering.sh` + `docs/asm/`: generated x86-64 code for push/pop under acquire/release and SeqCst, Rust and C++.
+- `examples/loadgen.rs`: TSC-based per-order timing with the observed clock step printed; allocation tracking no longer counts the histogram.
+- `.github/workflows/verify.yml`: Miri, ThreadSanitizer (Rust), TSan/ASan/UBSan (C++), loom, with negative controls. Linux-only; not executed on the Windows dev machine.
+
+**Stack**:
+
+| Component | Choice | Rationale |
+| --------- | ------ | --------- |
+| Model checker | `loom` 0.7 (cfg-gated dependency) | Exhaustive-within-bound exploration of the C11 memory model; checks `UnsafeCell` accesses for races |
+| Differential oracle | Hand-written flat `Vec` book in the test | Encodes the matching rules with no shared code or data structures with the engine |
+| C++ port | C++20, `std::atomic`, `alignas(64)`, `std::launder` | Same algorithm, same layout, same knobs; GCC 14 for a second compiler's view |
+| Codegen evidence | `rustc --emit asm`, `g++ -S` | Replace the "compiles to plain MOV" assertion with the instructions |
+| Sanitizers | Miri, TSan, ASan, UBSan via GitHub Actions | Only available on Linux |
+
+**Results**: see [VERIFICATION.md](VERIFICATION.md) and [MEMORY_ORDERING.md](MEMORY_ORDERING.md). Headlines: SeqCst costs 5.4–6.0x on u64 transfer; false sharing 2x; no cursor cache 1.4–1.7x; cross-thread Rust vs C++ is a tie within noise; single-threaded push+pop is 1.5–3.5x faster in C++, of which the bounds check accounts for 10–25%.
+
+**Status**: Complete. The sanitizer jobs were run by hand on Linux in Phase 9.
+
+---
+
+## Phase 9: Crash Consistency, Statistics, Linux Verification
+
+**Objective**: Make the evidence from Phase 8 hold up to a reviewer who probes every number: run the sanitizers that were only written, settle the Rust-vs-C++ question with statistics instead of two runs, find the root cause of the single-thread gap, and attack the persistence layer with faults instead of hand-picked cases.
+
+**Deliverables**:
+
+- `tests/crash_recovery.rs`: truncation and three corruption patterns at every byte offset of a WAL and of a snapshot, each followed by "keep writing, recover again"; a writer process killed mid-write over repeated cycles. Two defects found and fixed (stale-record resurrection in `Wal::open`; snapshot checksum not covering `wal_record_count`).
+- `fuzz/`: cargo-fuzz targets for the wire-protocol decoder (with encode/decode round-trip properties), arbitrary bytes as a WAL, and arbitrary bytes as a snapshot.
+- `examples/ring_throughput.rs`, `cpp/bench_ring.cpp`: `--pin P,C`, `--raw`, `--workload`; `scripts/bench_compare.py`: interleaved A/B driver with bootstrap CIs, Mann-Whitney U and Cliff's delta; `scripts/perf_counters.sh`: `perf stat` over the ring variants.
+- `src/ring.rs`: `Shared<T>` (a `ManuallyDrop<Arc<_>>` dropped by value) so the producer/consumer cursors stay in registers; `scripts/asm_loop.sh` and `docs/asm/*latency*` show the loop bodies that prove it.
+- `verify/ring-standalone`: zero-dependency crate that includes `src/ring.rs` by path for Miri and `-Zbuild-std` ThreadSanitizer; `--cfg ring_allow_unsound` for sanitizer negative controls.
+- `scripts/wsl_queue.sh`: the exact Linux sequence that was run; `.github/workflows/verify.yml` mirrors it.
+- `docs/METHODOLOGY.md`: how every benchmark is run and how much noise to expect.
+
+**Stack**:
+
+| Component | Choice | Rationale |
+| --- | --- | --- |
+| Fault injection | hand-rolled, in `cargo test` | every byte offset is enumerable for a small log; a pure-function command stream lets a killed process be resumed and checked |
+| Fuzzing | `cargo-fuzz` (libFuzzer) | coverage-guided; round-trip properties turn a crash-only target into a correctness oracle |
+| Statistics | pure-Python bootstrap, Mann-Whitney, Cliff's delta | distribution-free (the data are skewed); no numpy/scipy so the environment is reproducible |
+| Pinning | `sched_setaffinity` / `SetThreadAffinityMask` via raw FFI | no new crate; two distinct physical cores |
+| Counters | `perf stat` (Linux) | the only user-space PMU access on this machine |
+
+**Results**: [VERIFICATION.md §4–5](VERIFICATION.md), [MEMORY_ORDERING.md §5](MEMORY_ORDERING.md#5-the-single-thread-gap-explained-and-closed-2026-10-11), [METHODOLOGY.md §5–6](METHODOLOGY.md), [ROUND2_REPORT.md](../ROUND2_REPORT.md).
+
+**Status**: Complete, with the Linux steps that the memory-starved WSL2 VM could not finish listed as unverified in the report.
