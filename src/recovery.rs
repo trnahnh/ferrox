@@ -7,7 +7,7 @@ use crate::snapshot::{Snapshot, SnapshotError};
 use crate::wal::{Wal, WalError};
 
 #[derive(Debug)]
-pub(crate) enum RecoveryError {
+pub enum RecoveryError {
     Wal(WalError),
     Snapshot(SnapshotError),
 }
@@ -35,9 +35,22 @@ impl From<SnapshotError> for RecoveryError {
     }
 }
 
-pub(crate) fn recover(
+/// Rebuilds the engine from `<data_dir>/snapshots` + `<data_dir>/wal.bin`
+/// and returns it together with the opened WAL, positioned for appending.
+pub fn recover(
     data_dir: &Path,
     arena_capacity: u32,
+) -> Result<(MatchingEngine, Wal), RecoveryError> {
+    recover_with_wal_size(data_dir, arena_capacity, None)
+}
+
+/// Same as [`recover`], with an explicit initial WAL mapping size (the
+/// default is 64 MiB). Smaller sizes make fault-injection tests that open
+/// thousands of logs fast; production callers use [`recover`].
+pub fn recover_with_wal_size(
+    data_dir: &Path,
+    arena_capacity: u32,
+    wal_initial_size: Option<u64>,
 ) -> Result<(MatchingEngine, Wal), RecoveryError> {
     fs::create_dir_all(data_dir).map_err(WalError::Io)?;
 
@@ -53,7 +66,10 @@ pub(crate) fn recover(
     };
 
     let wal_path = data_dir.join("wal.bin");
-    let mut wal = Wal::open(&wal_path)?;
+    let mut wal = match wal_initial_size {
+        Some(size) => Wal::open_with_size(&wal_path, size)?,
+        None => Wal::open(&wal_path)?,
+    };
 
     let mut record_count_at_replay = start_record;
 
