@@ -20,6 +20,19 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 proptest = "1.10.0"
 tempfile = "3.26.0"
 
+# Only pulled in when building with `RUSTFLAGS="--cfg loom"` (see src/ring.rs).
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(loom)',
+    'cfg(ring_seqcst)',
+    'cfg(ring_no_padding)',
+    'cfg(ring_no_cursor_cache)',
+    'cfg(ring_relaxed_ordering)',
+] }
+
 [[bench]]
 name = "matching_bench"
 harness = false
@@ -44,3 +57,6 @@ name = "relay"
 
 [[example]]
 name = "loadgen"
+
+[[example]]
+name = "ring_throughput"
