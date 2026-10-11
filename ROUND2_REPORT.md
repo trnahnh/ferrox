@@ -19,7 +19,7 @@ New findings about the code, all from this round:
 1. **`Wal::open` resurrected discarded records.** After a corrupt/torn record, recovery stopped there but left the old bytes in place; new appends realigned with old record boundaries and the next recovery read the discarded history back. Fixed (`set_len` down to the valid prefix and back up; invariant: bytes beyond `write_pos` are zero).
 2. **`Snapshot` checksum covered `orders` only.** A corrupted `wal_record_count` (bytes 0–7 of the file) was accepted and replay started from the wrong record. Fixed: the checksum covers every field.
 3. **`Producer`/`Consumer` cursors lived on the stack in every hot loop** because `Arc::drop_slow(&mut self)` pins the containing struct in memory for LLVM. Fixed with a `ManuallyDrop<Arc<_>>` dropped by value; push/pop codegen unchanged.
-4. Observations that are not defects: cutting a record inside trailing zero bytes is indistinguishable from the intact record (112 of 625 offsets) and correctly recovers; a kill during `Snapshot::save` leaves a `.tmp` file the loader ignores and nobody cleans up; the persistence layer makes no power-loss claim (no `msync`/`fsync` ordering) and the harness does not test one.
+4. Observations that are not defects: cutting a record inside trailing zero bytes is indistinguishable from the intact record (112 of 625 offsets) and correctly recovers; a kill during `Snapshot::save` leaves a `.tmp` file the loader ignores and nobody cleans up; the persistence layer makes no power-loss claim (no `msync`/`fsync` ordering) and the harness does not test one; the kill-test child originally stopped at 50,000 records and reached that cap on a quiet machine (cycle 9 of 12 then timed out), so it now runs until killed.
 5. Round-1 methodology: two unpinned runs could not resolve a 10–17% effect that n = 40 interleaved runs resolve at p < 0.003. The round-1 "tie" was a limitation of the method, now documented in `docs/METHODOLOGY.md`.
 
 ## 2. Options considered and ranked
@@ -51,7 +51,7 @@ Ranked by (credibility gain × keyword value) / effort. "Spent" is approximate w
 | WAL truncation | 625 | 0 failures (after fixing the oracle, see §1.4) | 0 |
 | WAL corruption + continue writing | 1,548 | **698 failures** (16 records recovered where 3–14 were expected: stale records resurrected) | 0 |
 | snapshot corruption | 1,189 | **16 failures** (bytes 0–7: wrong `wal_record_count` accepted, state diverged from full replay) | 0 |
-| process kill | 12 cycles, 2,368 records | 0 | 0; every cycle: recovered count ∈ [last ack, last ack + 1], state == fresh replay == WAL-only replay |
+| process kill | 12 cycles, 92,525 records | 0 | 0; every cycle: recovered count ∈ [last ack, last ack + 1], state == fresh replay == WAL-only replay |
 
 **Reproduce:** `cargo test --release --test crash_recovery -- --nocapture --test-threads=1` (≈55–75 s on Windows, NTFS temp-dir churn). To see the defects: `git checkout a79fb71 -- src/wal.rs src/snapshot.rs` and run again.
 

@@ -162,7 +162,7 @@ earlier ids), so any process can regenerate exactly what another one wrote.
 | `wal_truncated_at_every_byte_offset_…` | log cut at every byte offset 0..=624 of a 16-record log; after recovery, 3 more records are appended, the process exits, and recovery runs again | 625 | 0 failures |
 | `wal_corrupted_at_every_byte_offset_…` | byte xor 0xFF, byte zeroed, bit 0 flipped, at every offset, each followed by the same append-and-recover-again step | 1,548 | **698 failures before the fix**, 0 after |
 | `snapshot_corrupted_at_every_byte_offset_…` | the same three mutations at every offset of a 566-byte snapshot, with a 40-record WAL whose first 25 records the snapshot covers | 1,189 | **16 failures before the fix**, 0 after |
-| `killed_writer_recovers_to_a_consistent_prefix` | a writer process (this test binary re-executed) appends and snapshots; it is `kill`ed at a varying point, recovery runs, the writer is restarted and resumes from the recovered state; 12 cycles | 12 kills, 2,368 records | 0 failures |
+| `killed_writer_recovers_to_a_consistent_prefix` | a writer process (this test binary re-executed) appends and snapshots; it is `kill`ed at a varying point, recovery runs, the writer is restarted and resumes from the recovered state; 12 cycles | 12 kills, 92,525 records (the writer runs until killed; an earlier 50,000-record cap let it finish early on a quiet machine, see the note below the table) | 0 failures |
 
 Two real defects, both fixed in this branch:
 
@@ -185,7 +185,7 @@ Two real defects, both fixed in this branch:
    Corruption of `best_bid`/`best_ask` was harmless (restore recomputes them)
    and is now also detected.
 
-Two observations that are not defects:
+Three observations that are not defects:
 
 - Cutting a record inside its trailing zero bytes (the high bytes of a small
   quantity) yields a file that is byte-identical to the intact one after the
@@ -198,6 +198,12 @@ Two observations that are not defects:
   prints how many hit each. Each kill during a save leaves a
   `snapshot_*.bin.tmp` behind, which the loader ignores by name; they are not
   cleaned up.
+- The writer child originally stopped after 50,000 records. With the host
+  otherwise idle it reached that cap in 8 of the 12 cycles, the ninth child
+  had nothing to write, and the parent timed out waiting for an
+  acknowledgement (2026-10-11, after the WSL VM had stopped). The child now
+  runs until killed; the per-cycle record counts depend on machine speed and
+  are printed, not asserted.
 
 Not covered, and therefore not claimed: durability across *power loss*. The WAL
 is an `mmap` with no `msync` ordering and the snapshot does no `fsync` before
@@ -209,8 +215,8 @@ $ cargo test --release --test crash_recovery -- --nocapture --test-threads=1
 wal truncation: 625 cases, 0 failures
 wal corruption: 1548 cases, 0 failures
 snapshot corruption: 1189 cases, 0 failures
-process-kill: 12 cycles, 2368 records total, ...
-test result: ok. 5 passed; finished in 54.61s        (Windows, release)
+process-kill: 12 cycles, 92525 records total, 7 kills during a snapshot save, 5 between appends, 12 cycles recovered through a snapshot, 7 cycles saw a leftover .tmp snapshot
+test result: ok. 5 passed; finished in 43.12s        (Windows, release, 2026-10-11)
 ```
 
 ## 6. Measurement checks that came out of the audit

@@ -403,7 +403,9 @@ fn crash_child_main() {
     writeln!(out, "resumed {i}").unwrap();
     out.flush().unwrap();
 
-    while i < 50_000 {
+    // Runs until the parent kills it: a fixed cap made the child finish early on a
+    // quiet machine (cycle 8 of 12 found nothing left to write and timed out).
+    loop {
         let cmd = command(seed, i);
         wal.append(&cmd).expect("append");
         apply(&mut engine, cmd);
