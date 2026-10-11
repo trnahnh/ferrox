@@ -254,3 +254,65 @@ With `--features alloc-track`, the load generator reports heap allocations durin
 | --- | --- | --- |
 | Test count | 134 | 137 (with `--features metrics`) |
 | Test time | ~0.16s | ~0.25s |
+
+---
+
+## Re-measurement (2026-10-10)
+
+An audit re-ran every headline number above on the same laptop (AMD Ryzen 7 7735HS, 8C/16T, Windows 11, power plan "Turbo", rustc 1.93.1). The sections above are left as written; this section records what reproduced and what did not.
+
+### Ring buffer (`cargo bench --bench ring_bench`)
+
+| Benchmark | Documented (Phase 4) | Last stored criterion run (`target/criterion`, Mar 2026) | 2026-10-10 |
+| --- | --- | --- | --- |
+| throughput/spsc_ring/1M | 1.85 ms | 2.45 ms | 3.06 ms |
+| throughput/std_mpsc/1M | 16.35 ms | 23.06 ms | 11.80 ms |
+| throughput/std_mpsc_spin/1M | 20.04 ms | 19.62 ms | 9.73 ms |
+| throughput/spsc_ring_order/1M | 5.51 ms | 10.24 ms | 12.79 ms |
+| throughput/std_mpsc_order/1M | 20.03 ms | 20.02 ms | 14.92 ms |
+| throughput/std_mpsc_spin_order/1M | 24.10 ms | 24.10 ms | 27.36 ms |
+| latency/push_pop_alternating | 2.11 ns | 2.09 ns | 2.37 ns |
+
+The documented 8.8x (u64) and 3.6x (Order) ratios did not reproduce: 3.9x vs blocking recv / 3.2x vs the spin variant, and 1.17x, respectively. The stored criterion data already disagreed with the documented ring numbers (2.45 ms and 10.24 ms vs 1.85 ms and 5.51 ms), so the documented values came from an earlier, faster session that was not preserved. `std::sync::mpsc` itself was faster today than documented; a change in the standard library between the rustc used in March and 1.93.1 is one possible cause, not a verified one. The benchmark includes thread creation and is unpinned; run-to-run variance of the same binary within one session is up to 1.4x (see [MEMORY_ORDERING.md §3](MEMORY_ORDERING.md#3-rust-vs-c-on-the-same-algorithm)).
+
+### End-to-end (`cargo bench --bench e2e_bench`)
+
+| Benchmark | Documented (Phase 7) | 2026-10-10 |
+| --- | --- | --- |
+| e2e/crossing_orders/1k | 34 µs | 49.1 µs |
+| e2e/crossing_orders/10k | 405 µs | 681 µs |
+| e2e/mixed_100k | 6.4 ms | 9.69 ms |
+| e2e/avg_crossing_100k | 5.6 ms | 6.75 ms |
+
+Everything is 1.2–1.7x slower than documented, including single-threaded code with no scheduling component, so the machine was in a slower state than in March (no cause identified; CPU reported at its base 3.2 GHz, no process hogging CPU, Windows Defender active). Relative comparisons within a session remain valid; absolute numbers should always be quoted with their session.
+
+### Load generator (`cargo run --release --example loadgen --features metrics`)
+
+| Clock | P50 | P90 | P99 | P99.9 | Mean | Max | Throughput |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Documented (Phase 7), `Instant` | 100 ns | 200 ns | 500 ns | 800 ns | 151 ns | ~38 µs | 4.7M/s |
+| 2026-10-10, `Instant` (pre-change binary), run 1 | 200 | 400 | 700 | 1800 | 266 | 260 µs | 2.92M/s |
+| 2026-10-10, `Instant` (pre-change binary), run 2 | 200 | 400 | 700 | 1700 | 252 | 297 µs | 3.05M/s |
+| 2026-10-10, `--instant` (new binary) | 200 | 500 | 1100 | 1600 | 291 | 963 µs | 2.63M/s |
+| 2026-10-10, TSC, run 1 | 130 | 321 | 832 | 1404 | 171 | 268 µs | 4.01M/s |
+| 2026-10-10, TSC, run 2 | 210 | 481 | 1062 | 1584 | 257 | 874 µs | 3.23M/s |
+| 2026-10-10, TSC, run 3 | 190 | 431 | 982 | 1684 | 250 | 558 µs | 3.21M/s |
+| 2026-10-10, no timing (`cargo run --release --example loadgen`) | — | — | — | — | — | — | 4.41M/s, 4.36M/s |
+
+Two corrections:
+
+1. **Clock resolution.** `std::time::Instant` on this machine advances in 100 ns steps (QueryPerformanceCounter at 10 MHz; measured over 5M consecutive reads, every non-zero delta was exactly 100 ns except 76 outliers). All `Instant` percentiles above, including the documented ones, are multiples of 100 ns for that reason. The TSC clock (0.3 ns step, calibrated at 3.194 GHz) is now the default.
+2. **Allocation attribution.** The documented "6 allocations from BTreeMap" was measured with the latency histogram created *after* tracking started, so it included the histogram's counts array: 6 allocations, 223,120 bytes. With the histogram created first: **5 allocations, 5 deallocations, 1,936 bytes** over 990,000 orders, identical with and without `--features metrics`. That is consistent with `BTreeMap` price-level node churn (about 390 bytes per node) and nothing else.
+
+The workload itself: 1M asks pre-loaded across 50 price levels, then 1M bids at the same 50 levels. Because bids sweep the lowest ask level first, 628,451 of the 990,000 measured bids fill and 361,549 rest in the book. The documented description implied every order crosses; it is a 63/37 mix.
+
+### Phase 8 measurements
+
+Rust-vs-C++ comparison, the cost of SeqCst, false sharing, cursor caching and bounds checks, and the loom results are in [MEMORY_ORDERING.md](MEMORY_ORDERING.md) and [VERIFICATION.md](VERIFICATION.md).
+
+### Test Suite (Phase 7→8)
+
+| Metric | Phase 7 | Phase 8 |
+| --- | --- | --- |
+| Test count | 137 (with `--features metrics`) | 141 (+3 differential book tests, +1 ring model test); +4 loom tests under `--cfg loom`; +6 C++ tests |
+| Test time | ~0.25s | ~0.2s unit + ~2.5s property tests; loom ~5.5s |
