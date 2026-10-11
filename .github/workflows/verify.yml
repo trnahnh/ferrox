@@ -1,8 +1,11 @@
-# Verification jobs that need a Linux toolchain. Every command here was run by
-# hand in WSL2 Ubuntu 24.04 on 2026-10-11 (scripts/wsl_queue.sh is the exact
-# sequence; results in docs/VERIFICATION.md and ROUND2_REPORT.md). The
-# workflow itself has not been executed on GitHub Actions: this repository has
-# not been pushed since it was written.
+# Verification jobs that need a Linux toolchain. scripts/wsl_queue.sh is the
+# same sequence for a local Linux box. Status when this file was last edited
+# (2026-10-11): the cpp-sanitizers commands were run by hand in WSL2 Ubuntu
+# 24.04 (pass; the Relaxed negative control exits 66); the test and loom jobs
+# pass on Windows; the miri, tsan-rust and fuzz jobs had NOT been completed
+# anywhere (the WSL2 VM ran out of memory). Results: docs/VERIFICATION.md,
+# ROUND2_REPORT.md. The first GitHub Actions execution is the pull request
+# that merges round2/ferrox.
 name: verify
 
 on:

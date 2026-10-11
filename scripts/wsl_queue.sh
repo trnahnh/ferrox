@@ -16,7 +16,7 @@ export CARGO_TARGET_DIR="$HOME/ferrox-target"
 export CARGO_BUILD_JOBS=1
 export CARGO_TERM_COLOR=never
 export RUSTUP_UNPACK_RAM=200000000 RUSTUP_IO_THREADS=1
-REPO=${REPO:-/mnt/d/Projects/Trading-Matching-Engine/ferrox}
+REPO=${REPO:-$(cd "$(dirname "$0")/.." && pwd)}
 LOGS="$HOME/ferrox-build/logs"
 BIN="$HOME/ferrox-build"
 mkdir -p "$LOGS"
