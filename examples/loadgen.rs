@@ -254,11 +254,14 @@ fn run_direct(use_instant_clock: bool) {
 
     println!("Warmup complete ({warmup_done} orders)");
 
-    #[cfg(feature = "alloc-track")]
-    ferrox::alloc_track::start_tracking();
-
+    // The recorder (an HdrHistogram with a ~200 KB counts array) must exist
+    // before allocation tracking starts, otherwise its allocation is counted
+    // against the engine.
     #[cfg(feature = "metrics")]
     let mut recorder = LatencyRecorder::new();
+
+    #[cfg(feature = "alloc-track")]
+    ferrox::alloc_track::start_tracking();
 
     let measured_start = std::time::Instant::now();
     let mut measured_count = 0u64;

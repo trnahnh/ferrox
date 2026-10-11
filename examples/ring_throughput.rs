@@ -24,7 +24,7 @@ fn make_order(id: u64) -> Order {
     Order::new(
         id,
         id % 100,
-        if id % 2 == 0 { Side::Bid } else { Side::Ask },
+        if id.is_multiple_of(2) { Side::Bid } else { Side::Ask },
         10_000 + (id as i64 % 500),
         (id % 1000) + 1,
         id * 1000,
