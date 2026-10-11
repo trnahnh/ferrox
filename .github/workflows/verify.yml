@@ -1,0 +1,96 @@
+# Verification jobs that need a Linux toolchain and therefore cannot run on the
+# Windows development machine: Miri (undefined-behaviour detection in the
+# unsafe slot code), ThreadSanitizer for the Rust ring, ThreadSanitizer /
+# AddressSanitizer / UndefinedBehaviorSanitizer for the C++ port, plus the
+# portable checks (unit + property tests, loom model checking) for completeness.
+#
+# Status: written on Windows and NOT executed locally; the first push of this
+# branch is the first run. See ENHANCEMENT_REPORT.md.
+name: verify
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: unit + property tests (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --features metrics
+
+  loom:
+    name: loom model check (SPSC ring)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: shipped ordering must pass
+        run: RUSTFLAGS="--cfg loom" cargo test --release --test loom_ring
+      - name: relaxed ordering must be caught (negative control)
+        run: |
+          if RUSTFLAGS="--cfg loom --cfg ring_relaxed_ordering" cargo test --release --test loom_ring; then
+            echo "loom did not report the data race in the relaxed-ordering ring" >&2
+            exit 1
+          fi
+
+  miri:
+    name: miri (unsafe slot code, single-threaded)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - run: cargo miri setup
+      # The concurrent unit tests move 100k items each; under Miri's
+      # interpreter that takes minutes, and cross-thread ordering is already
+      # covered by loom and TSan. Everything else in the ring module runs.
+      - run: cargo miri test --lib ring:: -- --skip concurrent_
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+
+  tsan-rust:
+    name: ThreadSanitizer (Rust ring)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - run: >
+          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu
+          --lib ring:: -- --test-threads=1
+        env:
+          RUSTFLAGS: -Zsanitizer=thread
+          RUSTDOCFLAGS: -Zsanitizer=thread
+
+  cpp-sanitizers:
+    name: C++ ring under TSan, ASan, UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ThreadSanitizer
+        run: |
+          clang++ -std=c++20 -O1 -g -fsanitize=thread -pthread cpp/test_ring.cpp -o test_tsan
+          ./test_tsan
+      - name: AddressSanitizer + UndefinedBehaviorSanitizer
+        run: |
+          clang++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -pthread cpp/test_ring.cpp -o test_asan
+          ./test_asan
+      - name: relaxed ordering must be caught by TSan (negative control)
+        run: |
+          clang++ -std=c++20 -O1 -g -fsanitize=thread -pthread -DFERROX_RELAXED_UNSOUND cpp/test_ring.cpp -o test_tsan_relaxed
+          if ./test_tsan_relaxed; then
+            echo "TSan did not report the data race in the relaxed-ordering ring" >&2
+            exit 1
+          fi
+      - name: plain build and benchmark smoke test
+        run: |
+          g++ -std=c++20 -O3 -pthread cpp/bench_ring.cpp -o bench_ring
+          ./bench_ring 3 100000

@@ -13,6 +13,7 @@
 //! | `ring_no_padding`        | head and tail share one cache line (false sharing experiment)         |
 //! | `ring_no_cursor_cache`   | always reload the remote cursor instead of using the local copy        |
 //! | `ring_relaxed_ordering`  | `Relaxed` cursor accesses. **Unsound.** Only compiles together with `loom`, where it exists to show the model checker catches the resulting data race |
+//! | `ring_unchecked_index`   | index the slot array with `get_unchecked` (the index is always `< len` because it is masked, but safe Rust cannot express that); measures the cost of the bounds check |
 //!
 //! ```text
 //! RUSTFLAGS="--cfg loom" cargo test --release --test loom_ring
@@ -168,6 +169,26 @@ struct RingBufferInner<T> {
     tail: CachePadded<AtomicUsize>,
 }
 
+impl<T> RingBufferInner<T> {
+    /// The slot for a free-running cursor value.
+    #[inline]
+    fn slot(&self, cursor: usize) -> &Slot<T> {
+        let index = cursor & self.mask;
+
+        #[cfg(not(ring_unchecked_index))]
+        {
+            &self.buffer[index]
+        }
+
+        #[cfg(ring_unchecked_index)]
+        // SAFETY: `mask == buffer.len() - 1` and `buffer.len()` is a power of
+        // two, so `cursor & mask < buffer.len()` for every cursor value.
+        unsafe {
+            self.buffer.get_unchecked(index)
+        }
+    }
+}
+
 // SAFETY: The SPSC protocol guarantees that only the Producer writes to slots
 // and advances `head`, while only the Consumer reads from slots and advances
 // `tail`. The Acquire/Release ordering on the atomic cursors establishes the
@@ -214,11 +235,13 @@ impl<T> Producer<T> {
             }
         }
 
+        let slot = self.inner.slot(head);
+
         // SAFETY: Producer has exclusive write access to buffer[head & mask].
         // The slot has been released by the consumer (tail has advanced past it)
         // or was never written (initial state). The Acquire load of `tail`
         // above ensures the consumer's read of the previous value is complete.
-        unsafe { self.inner.buffer[head & self.inner.mask].write(value) };
+        unsafe { slot.write(value) };
 
         self.inner.head.store(head.wrapping_add(1), STORE_ORDER);
         self.cached_head = head.wrapping_add(1);
@@ -252,11 +275,13 @@ impl<T> Consumer<T> {
             }
         }
 
+        let slot = self.inner.slot(tail);
+
         // SAFETY: Consumer has exclusive read access to buffer[tail & mask].
         // The slot was written by the producer (head has advanced past it).
         // The Acquire load of `head` above ensures the producer's write is
         // visible.
-        let value = unsafe { self.inner.buffer[tail & self.inner.mask].read() };
+        let value = unsafe { slot.read() };
 
         self.inner.tail.store(tail.wrapping_add(1), STORE_ORDER);
         self.cached_tail = tail.wrapping_add(1);
