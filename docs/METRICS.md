@@ -358,5 +358,5 @@ The register-promotion fix also moved the cross-thread Order48 number (before fi
 
 | Metric | Phase 8 | Phase 9 |
 | --- | --- | --- |
-| Test count | 141 (with `--features metrics`) | 147 (+5 crash-consistency, +1 snapshot checksum); +4 loom; +6 C++; +13 ring tests again in `verify/ring-standalone`; 3 fuzz targets |
+| Test count | 141 (with `--features metrics`) | 148 (+5 crash-consistency, +1 snapshot checksum, +1 fuzz regression); +4 loom; +6 C++; +13 ring tests again in `verify/ring-standalone`; 3 fuzz targets |
 | Test time | ~0.2s unit + ~2.5s property | + 55–75 s for `crash_recovery` on Windows (NTFS temp-dir churn; seconds on Linux) |

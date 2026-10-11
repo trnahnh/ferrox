@@ -126,10 +126,10 @@ honestly below and in [ROUND2_REPORT.md](../ROUND2_REPORT.md).
 | C++ ThreadSanitizer | `clang++ -std=c++20 -O1 -g -fsanitize=thread -pthread cpp/test_ring.cpp` | **6 tests ok, no report, exit 0** |
 | C++ ASan + UBSan | `clang++ … -fsanitize=address,undefined -fno-omit-frame-pointer` | **6 tests ok, no report, exit 0** |
 | C++ TSan negative control | same, `-DFERROX_RELAXED_UNSOUND` | **caught**: `WARNING: ThreadSanitizer: data race … spsc_ring.hpp:175:13 in Consumer::pop` (the slot read racing the producer's slot write), 2 reports, exit 66 |
-| Rust Miri (ring, single-threaded tests) | `cd verify/ring-standalone && MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri test -- --skip concurrent_` | see ROUND2_REPORT.md §3 (filled in from the queue log) |
-| Rust ThreadSanitizer (ring, concurrent tests) | `cd verify/ring-standalone && RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu` | see ROUND2_REPORT.md §3 |
-| Rust TSan negative control | same with `--cfg ring_relaxed_ordering --cfg ring_allow_unsound`, must print `ThreadSanitizer: data race` | see ROUND2_REPORT.md §3 |
-| loom on Linux + negative control | `RUSTFLAGS="--cfg loom" cargo test --release --test loom_ring` | see ROUND2_REPORT.md §3 (passes on Windows, §1) |
+| Rust Miri (ring, single-threaded tests) | `cd verify/ring-standalone && MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri test -- --skip concurrent_` | **10 passed** (GitHub Actions, nightly, 1.45 s; the 3 `concurrent_` tests are skipped by design); not completed in WSL |
+| Rust ThreadSanitizer (ring, concurrent tests) | `cd verify/ring-standalone && RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu` | **13 passed under TSan** (GitHub Actions, `--lib`; the first run then failed on the doctest binary, which rustdoc builds unsanitized); not completed in WSL |
+| Rust TSan negative control | same with `--cfg ring_relaxed_ordering --cfg ring_allow_unsound`, must print `ThreadSanitizer: data race` | **caught** (GitHub Actions run 2: `negative control OK: TSan reported the race`); not completed in WSL |
+| loom on Linux + negative control | `RUSTFLAGS="--cfg loom" cargo test --release --test loom_ring` | **4 passed, 3.01 s; Relaxed caught** (`Causality violation: Concurrent read and write accesses.`), GitHub Actions; passes on Windows too (§1) |
 
 Why `verify/ring-standalone` exists: `-Zbuild-std` rebuilds the standard
 library with TSan and Miri interprets every instruction, so both are run on a

@@ -131,7 +131,7 @@ Measured, not estimated: **~$0.041/hr** to run (70% of that is the NLB, not the 
 | 8 | loom model checking, differential property tests, C++ port, memory-ordering and cache analysis | Done |
 | 9 | crash-consistency fault injection, pinned statistics, single-thread gap root-caused, sanitizers run on Linux, fuzzing | Done (see ROUND2_REPORT.md for what remains unverified) |
 
-147 tests with `--features metrics` (138 unit + 4 differential + 5 crash-consistency), plus 4 loom model checks under `--cfg loom`, 6 C++ tests and 3 fuzz targets. `unsafe` inventory: 7 blocks + 3 `unsafe impl` in the ring buffer (3 primitive slot operations, their 3 call sites, and the `ManuallyDrop::take` in `Shared::drop`), 2 blocks in the WAL mmap, 2 blocks + 1 `unsafe impl` in the tracking allocator; every one has a documented invariant. See [docs/VERIFICATION.md §3](docs/VERIFICATION.md#3-unsafe-inventory).
+148 tests with `--features metrics` (139 unit + 4 differential + 5 crash-consistency), plus 4 loom model checks under `--cfg loom`, 6 C++ tests and 3 fuzz targets. `unsafe` inventory: 7 blocks + 3 `unsafe impl` in the ring buffer (3 primitive slot operations, their 3 call sites, and the `ManuallyDrop::take` in `Shared::drop`), 2 blocks in the WAL mmap, 2 blocks + 1 `unsafe impl` in the tracking allocator; every one has a documented invariant. See [docs/VERIFICATION.md §3](docs/VERIFICATION.md#3-unsafe-inventory).
 
 ## Quick Start
 

@@ -1,6 +1,6 @@
 # Round 2 Report — Ferrox, 2026-10-11
 
-Branch: `round2/ferrox`, created from `enhance/verification-and-benchmarks` (round 1, 7 commits over `main` at `079a748`). `main` untouched, nothing pushed, no files deleted, no force pushes. Nothing outside the repository was modified except inside the WSL2 Ubuntu distro (apt packages, rustup, `~/ferrox-build`, `~/ferrox-target`), which the brief allowed.
+Branch: `round2/ferrox`, created from `enhance/verification-and-benchmarks` (round 1, 7 commits over `main` at `079a748`). `main` untouched by this work; both branches were pushed on 2026-10-11 and merged through PR #2 after `verify.yml` ran green; no files deleted, no force pushes. Nothing outside the repository was modified except inside the WSL2 Ubuntu distro (apt packages, rustup, `~/ferrox-build`, `~/ferrox-target`), which the brief allowed.
 
 Machines: the same AMD Ryzen 7 7735HS laptop as round 1 (Windows 11, rustc 1.93.1, g++ 14.2.0 MSYS2) plus WSL2 Ubuntu 24.04 on it (gcc 13.3, clang 18.1.3, rustc stable 1.99.0 / nightly 1.101.0, perf 6.8.12). Every number below comes from a command listed next to it; none is estimated or rounded beyond what the tool printed. Where a run could not be completed, that is stated rather than filled in.
 
@@ -21,6 +21,7 @@ New findings about the code, all from this round:
 3. **`Producer`/`Consumer` cursors lived on the stack in every hot loop** because `Arc::drop_slow(&mut self)` pins the containing struct in memory for LLVM. Fixed with a `ManuallyDrop<Arc<_>>` dropped by value; push/pop codegen unchanged.
 4. Observations that are not defects: cutting a record inside trailing zero bytes is indistinguishable from the intact record (112 of 625 offsets) and correctly recovers; a kill during `Snapshot::save` leaves a `.tmp` file the loader ignores and nobody cleans up; the persistence layer makes no power-loss claim (no `msync`/`fsync` ordering) and the harness does not test one; the kill-test child originally stopped at 50,000 records and reached that cap on a quiet machine (cycle 9 of 12 then timed out), so it now runs until killed.
 5. Round-1 methodology: two unpinned runs could not resolve a 10–17% effect that n = 40 interleaved runs resolve at p < 0.003. The round-1 "tie" was a limitation of the method, now documented in `docs/METHODOLOGY.md`.
+6. **Found by the first CI fuzz run, after this report was first written:** a WAL record whose payload is the single byte `0xFF` passes the CRC check (CRC32 of `0xFF` is `0xFF000000`) and fails to decode, and recovery returns an error for it. The error is the intended behaviour (refuse to start on a CRC-valid record that is not a message); the fuzz oracle that demanded success was wrong and was corrected, with the input kept as a seed and a unit test. Details in R6.
 
 ## 2. Options considered and ranked
 
@@ -32,9 +33,9 @@ Ranked by (credibility gain × keyword value) / effort. "Spent" is approximate w
 | 2 | Single-thread gap root cause + fix | 2 | 2.5 | LLVM IR, SROA/mem2reg, store-to-load forwarding, escape analysis, codegen | **Done** |
 | 3 | Pinning + interleaved statistics driver | 2 | 2 | CPU affinity, bootstrap CI, Mann-Whitney U, effect size, benchmark methodology | **Done** (Windows; Linux in queue) |
 | 4 | Linux sanitizers (C++ TSan/ASan/UBSan + negative control) | 1 | 1.5 (toolchain fights) | ThreadSanitizer, AddressSanitizer, UBSan, data race, negative control | **Done** |
-| 5 | Linux Rust verification: Miri, TSan, loom; zero-dependency ring crate | 2 | 2+ | Miri, undefined behaviour, `-Zbuild-std`, provenance, CI parity | Crate done; runs queued on a starved VM, see §6 |
-| 6 | cargo-fuzz: protocol decoder (+ WAL and snapshot loaders) with coverage | 1.5 | 1 (+ queue) | libFuzzer, coverage-guided fuzzing, round-trip property, parser hardening, corpus | Targets written; runs queued, see §6 |
-| 7 | `perf stat` hardware counters per ring variant | 1 | 0.5 (+ queue) | PMU, cache misses, LLC, branch misprediction, IPC | Script done; run queued, see §6 |
+| 5 | Linux Rust verification: Miri, TSan, loom; zero-dependency ring crate | 2 | 2+ | Miri, undefined behaviour, `-Zbuild-std`, provenance, CI parity | **Done in CI**: Miri 10 pass, TSan 13 pass, loom 4 pass, both negative controls caught; never completed in WSL |
+| 6 | cargo-fuzz: protocol decoder (+ WAL and snapshot loaders) with coverage | 1.5 | 1 (+ queue) | libFuzzer, coverage-guided fuzzing, round-trip property, parser hardening, corpus | **Run in CI**, 3 × 60 s, one finding (oracle corrected, seed + unit test added); 600 s runs and coverage report not done |
+| 7 | `perf stat` hardware counters per ring variant | 1 | 0.5 (+ queue) | PMU, cache misses, LLC, branch misprediction, IPC | **Not run**: WSL never reached it, hosted runners have no PMU |
 | 8 | METHODOLOGY.md | 1 | 1 | clock resolution, noise budget, interleaving, pinning, reproducibility | **Done** |
 | 9 | C++ order-book core | 5 | — | — | Not done (same reasoning as round 1: compares `std::map` to `BTreeMap`) |
 
@@ -125,21 +126,49 @@ The race TSan reports under `Relaxed` is the consumer's slot read against the pr
 
 **Change.** `verify/ring-standalone`: a crate with no dependencies that includes `src/ring.rs` by path, so `-Zbuild-std` TSan and Miri process only the ring and `std`. The one ring test that touched `crate::order` now uses a local 48-byte payload. `--cfg ring_allow_unsound` lets the Relaxed variant compile for a Rust TSan negative control (`compile_error!` otherwise). `scripts/wsl_queue.sh` is the exact sequence; `verify.yml` mirrors it.
 
-**Result:** see §6. The WSL2 VM (3.9 GB, ~3.5 GB held by Docker Desktop containers that are not mine to stop) swapped continuously; the rustup nightly install alone was interrupted three times. The queue runs the stable-toolchain steps first (loom + negative control → perf → pinned and unpinned variance → full test suite) and then installs nightly for Miri → TSan → TSan negative control → fuzzing + coverage, one job at a time; the log at `~/ferrox-build/logs/queue.log` is the record. Whatever it had produced by the time this report was finalized is in §6; the rest is unverified, not assumed.
+**Result, locally:** none. The WSL2 VM (3.9 GB, ~3.5 GB held by Docker Desktop containers that are not mine to stop) swapped continuously; the rustup nightly install alone was interrupted three times, and the final queue run (stable steps first, then nightly for Miri → TSan → TSan negative control → fuzzing + coverage) never got past compiling the loom test before the VM stopped responding.
 
-**Reproduce:** `bash scripts/wsl_queue.sh` on any Linux box with rustup, clang, perf and python3; or push the branch and read the `miri` / `tsan-rust` / `loom` jobs.
+**Result, GitHub Actions (first execution of `verify.yml`, PR #2, 2026-10-11, `ubuntu-latest`):**
+
+| job | run 1 (`86849e9`) | run 2 (`6052975`) |
+| --- | --- | --- |
+| `miri` (nightly, `-Zmiri-strict-provenance`, 10 single-threaded ring tests) | **10 passed**, 1.45 s | 10 passed |
+| `loom` on Linux | **4 passed**, 3.01 s | 4 passed |
+| `loom` negative control (Relaxed) | **caught**: `Causality violation: Concurrent read and write accesses.` in `unconsumed_items_are_dropped_exactly_once` | caught |
+| `tsan-rust` (`-Zsanitizer=thread`, `-Zbuild-std`, 13 ring tests) | **13 passed under TSan**, then the job failed: rustdoc built the (empty) doctest binary without the sanitizer flag and could not link against the sanitized std (`mixing -Zsanitizer will cause an ABI mismatch`) | `--lib` added: **13 passed**, 0.18 s, job green in 55 s |
+| `tsan-rust` negative control | did not run (step above failed first) | **caught**: `negative control OK: TSan reported the race` (the step greps the TSan output of the Relaxed + `ring_allow_unsound` build for `ThreadSanitizer: data race`) |
+| `test` (147 tests incl. the crash harness, Linux) | **all passed**; `crash_recovery` 1.93 s on Linux vs 43 s on Windows NTFS | all passed |
+| `cpp-sanitizers` | pass / pass / Relaxed caught, 15 s | same |
+
+**Reproduce:** `bash scripts/wsl_queue.sh` on any Linux box with rustup, clang, perf and python3; or open the PR's `miri` / `tsan-rust` / `loom` job logs (links in the PR checks).
 
 **Keywords:** Miri, strict provenance, `-Zbuild-std`, sanitizer-instrumented std, CI parity.
 
 **Google scale.** Interpreting unsafe code under Miri is the closest thing Rust has to a proof that the `// SAFETY` comments are true, and running it on the smallest possible crate is how it stays cheap enough to run on every change. A verification step that only works on a 64 GB build server is a step that gets skipped; shrinking it to "the ring and std" is the engineering. Reporting "queued on a starved VM" instead of a green checkmark is the only version of this result that a reviewer can trust.
 
-### R6. Hardware counters and fuzzing (written, queued)
+### R6. Hardware counters (not run) and fuzzing (run in CI, one finding)
 
 `scripts/perf_counters.sh` runs the u64 workload of the shipped, no-padding, SeqCst and no-cursor-cache builds under `perf stat -r 5` (cycles, instructions, cache references/misses, LLC loads/misses, branches/misses, context switches, migrations). The WSL2 kernel reports `AMD PMU driver` and `perf_event_paranoid = 2`; which events the hypervisor actually virtualizes is only known once the script runs, and `<not supported>` is printed as such.
 
-`fuzz/` has three libFuzzer targets: `protocol_decode` (every prefix of the input through `decode_message` and `decode_execution_report`, plus encode→decode round-trip equality for anything that decodes), `wal_recover` (arbitrary bytes as a WAL; recovery must succeed, bound the record count, and be idempotent), `snapshot_load` (arbitrary bytes as the newest snapshot; recovery must not fail). The queue runs each for 600 s and produces an `llvm-cov` report for the decoder.
+`fuzz/` has three libFuzzer targets: `protocol_decode` (every prefix of the input through `decode_message` and `decode_execution_report`, plus encode→decode round-trip equality for anything that decodes), `wal_recover` (arbitrary bytes as a WAL; recovery must not panic, must be deterministic, and may fail only with a protocol error on a CRC-valid record), `snapshot_load` (arbitrary bytes as the newest snapshot; recovery must not fail). The queue runs each for 600 s and produces an `llvm-cov` report for the decoder; CI runs each for 60 s.
 
-**Result:** see §6.
+**Result, counters:** not run (WSL VM; see §6).
+
+**Result, fuzzing (GitHub Actions, 60 s per target, first execution 2026-10-11):**
+
+| target | executions | libFuzzer `cov` / `ft` | corpus | outcome |
+| --- | --- | --- | --- | --- |
+| `protocol_decode` | 18,716,668 | 80 / 215 | 44 units, 1,128 b | no crash |
+| `wal_recover` (run on push) | 87,568 | 260 / 328 | 28 units | **crash** after 26 s: `recovery of an arbitrary log must not fail: Wal(Protocol(UnknownMessageType(255)))` |
+| `wal_recover` (run on pull_request, same commit) | 142,206 | 240 / 275 | 27 units | no crash in 60 s |
+| `snapshot_load` | 119,573 | 418 / 540 | 57 units, 4,612 b | no crash |
+| run 2 (`6052975`, corrected oracle, seed committed): `protocol_decode` | 35,987,090 | 80 / 215 | 44 units | no crash |
+| run 2: `wal_recover` (`seed corpus: files: 1 min: 82b max: 82b`) | 212,671 | 313 / 439 | 37 units, 318 b | no crash; the seed is replayed first |
+| run 2: `snapshot_load` | 174,384 | 420 / 552 | 59 units, 4,995 b | no crash |
+
+`cov` for `protocol_decode` is identical across runs (80 edges) and did not move after the first seconds: the decoder is small and the fuzzer saturates it; the round-trip property is what the remaining executions exercise. The `llvm-cov` line-coverage report was not produced (that step is in the WSL queue, which never ran).
+
+The `wal_recover` input is 82 bytes: `01 00 00 00 | 00 00 00 ff | ff …`, a record with `payload_len = 1`, `crc32 = 0xFF000000` and payload `0xFF`. CRC32 of the single byte `0xFF` *is* `0xFF000000`, so the WAL accepts the record and `decode_message` rejects message type 255. Recovery returned `RecoveryError::Wal(WalError::Protocol(..))`: no panic, no undefined behaviour, no silent truncation. The oracle had asserted that recovery always succeeds; that was the oracle's mistake, and the decision taken is that a CRC-valid record that does not decode means a writer bug, a foreign log or a 1-in-2³² collision, and the engine must refuse to start rather than guess. The oracle now allows exactly that error and requires it to be deterministic; the input is committed as a seed in `fuzz/corpus/wal_recover/` (sha1 `aeeda5a0…`, the CI artifact name) and as the unit test `crc_valid_undecodable_record_refuses_to_start` in `src/recovery.rs`. That the finding appeared in one 60 s run and not in the other at the same commit is why the seed is committed.
 
 **Keywords:** PMU, cache-miss attribution, coverage-guided fuzzing, libFuzzer, parser round-trip property.
 
@@ -181,17 +210,18 @@ fault injection and crash consistency · write-ahead logging and idempotent reco
 
 ## 6. What remains unverified
 
-Status of the Linux queue (`~/ferrox-build/logs/queue.log` in WSL) at the time this report was finalized is recorded in the table below. The last queue run started at 01:29 (WSL clock) and was still inside its first step (compiling the loom test) when the VM stopped responding (`Wsl/Service/HCS_E_CONNECTION_TIMEOUT`); earlier attempts died the same way. "Not completed" means the step never finished on the memory-starved VM; it does not mean it failed.
+The local Linux queue (`~/ferrox-build/logs/queue.log` in WSL) never completed a step: the last run started at 01:29 (WSL clock) and was still compiling the loom test when the VM stopped responding (`Wsl/Service/HCS_E_CONNECTION_TIMEOUT`); earlier attempts died the same way. The branch was then pushed and `verify.yml` executed on GitHub Actions for the first time (PR #2). Status per step, with where the evidence is:
 
 | step | status |
 | --- | --- |
-| C++ TSan / ASan+UBSan / negative control | completed, pass / pass / caught (R4) |
-| loom on Linux + negative control | not completed (passes on Windows, VERIFICATION.md §1) |
-| Miri on the ring | not completed |
-| Rust TSan + negative control | not completed |
-| `perf stat` counters | not completed |
-| pinned Linux variance study (Rust, g++, clang++, unchecked) | not completed (Windows study completed, R3) |
-| fuzzing, 3 × 600 s + coverage | not completed |
-| full test suite incl. crash harness on Linux | not completed (passes on Windows) |
+| C++ TSan / ASan+UBSan / negative control | pass / pass / caught, in WSL (R4) and in CI |
+| loom on Linux + negative control | **pass / caught in CI** (R5); not completed in WSL |
+| Miri on the ring (10 single-threaded tests) | **pass in CI** (R5); not completed in WSL |
+| Rust TSan, 13 ring tests | **pass in CI** (R5); not completed in WSL |
+| Rust TSan negative control | **caught in CI** (run 2, R5); not completed in WSL |
+| `perf stat` counters | **not run anywhere** (hosted runners expose no PMU; WSL never got there) |
+| pinned Linux variance study (Rust, g++, clang++, unchecked) | **not run** (Windows study completed, R3; hosted runners are too noisy and not pinnable to physical cores) |
+| fuzzing | 3 × 60 s in CI with one finding (R6); the 3 × 600 s runs and the `llvm-cov` report **not run** |
+| full test suite incl. crash harness on Linux | **pass in CI** (147 tests, run 1; 148 with the fuzz regression test, run 2) |
 
-Also not claimed: power-loss durability of the WAL/snapshot (no `fsync`/`msync` ordering; the harness tests process crashes only); any number from a quiet machine (every 2026-10-11 run shared the host with a swapping VM; `docs/METHODOLOGY.md §8` says how much that is worth); GitHub Actions has never executed `verify.yml` (the branch has not been pushed).
+Also not claimed: power-loss durability of the WAL/snapshot (no `fsync`/`msync` ordering; the harness tests process crashes only); any number from a quiet machine (every 2026-10-11 benchmark shared the host with a swapping VM; `docs/METHODOLOGY.md §8` says how much that is worth); any benchmark number from CI (none is taken there).
